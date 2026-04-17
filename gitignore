@@ -1,0 +1,27 @@
+# Dane obrazowe
+data/
+*.jpg
+*.jpeg
+*.dng
+*.raw
+*.png
+*.tiff
+*.bmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
