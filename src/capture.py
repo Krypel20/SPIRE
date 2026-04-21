@@ -60,7 +60,6 @@ IMU_SHM_NAME = "spire_imu_state"
 
 log = logging.getLogger("spire.capture")
 
-
 def setup_logging(output_dir, verbose=False):
     """Configure logging to console + file."""
     os.makedirs(output_dir, exist_ok=True)
@@ -90,32 +89,44 @@ def setup_logging(output_dir, verbose=False):
 # IMU shared memory interface (stub — filled by imu_reader)
 # ---------------------------------------------------------------------------
 
+_imu_shm = None
+
 def try_read_imu():
     """Attempt to read IMU state from shared memory.
 
     Returns dict with gyro/accel/timestamp if available, None otherwise.
-    When imu_reader process is running, it writes current state to shared
-    memory block 'spire_imu_state'. This function reads it non-blocking.
-
     Format (when implemented):
         64 bytes: JSON-encoded dict with keys:
         - gyro_x, gyro_y, gyro_z (°/s)
         - accel_x, accel_y, accel_z (m/s²)
         - timestamp_mono_ns (int)
     """
+    global _imu_shm
+
     try:
         from multiprocessing import shared_memory
-        shm = shared_memory.SharedMemory(name=IMU_SHM_NAME, create=False)
-        raw = bytes(shm.buf[:shm.size]).rstrip(b'\x00')
-        shm.close()
+
+        if _imu_shm is None:
+            _imu_shm = shared_memory.SharedMemory(
+                name=IMU_SHM_NAME, create=False
+            )
+            # Unregister from resource tracker — we don't own this memory
+            from multiprocessing import resource_tracker
+            resource_tracker.unregister(
+                f"/{IMU_SHM_NAME}", "shared_memory"
+            )
+
+        raw = bytes(_imu_shm.buf[:_imu_shm.size]).rstrip(b'\x00')
         if raw:
             return json.loads(raw.decode("utf-8"))
+
     except FileNotFoundError:
-        pass
+        _imu_shm = None
     except Exception as e:
         log.debug(f"IMU read failed: {e}")
-    return None
+        _imu_shm = None
 
+    return None
 
 def compute_max_angular_velocity(exposure_us, focal_length_mm=FOCAL_LENGTH_MM):
     """Compute max angular velocity [°/s] for <1px blur.
