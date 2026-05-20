@@ -30,12 +30,12 @@ IMU_SHM_NAME = "spire_imu_state"
 SERVO_RANGE_DEG = 90.0
 
 # PID gains — start with P only, add I and D if needed
-KP = 1.0    # Proportional gain
+KP = 0.5    # Proportional gain
 KI = 0.0    # Integral gain (0 = disabled)
 KD = 0.0    # Derivative gain (0 = disabled)
 
 # Deadband — ignore small movements below this threshold (°/s)
-GYRO_DEADBAND_DPS = 0.3
+GYRO_DEADBAND_DPS = 1.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -144,6 +144,7 @@ def main():
     last_report = time.monotonic()
 
     try:
+        prev_gyro_z = 0.0
         while running:
             now = time.monotonic()
             dt = now - last_time
@@ -161,6 +162,10 @@ def main():
             # Apply deadband
             if abs(gyro_z) < GYRO_DEADBAND_DPS:
                 gyro_z = 0.0
+
+            # Low-pass filter — smooth out noise
+            gyro_z = gyro_z * 0.3 + prev_gyro_z * 0.7
+            prev_gyro_z = gyro_z
 
             # Integrate gyro Z → yaw angle
             yaw_angle += gyro_z * dt
