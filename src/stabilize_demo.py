@@ -23,7 +23,7 @@ from gpiozero.pins.lgpio import LGPIOFactory
 # Config
 # ---------------------------------------------------------------------------
 
-SERVO_PIN = 18
+SERVO_PIN = 12
 IMU_SHM_NAME = "spire_imu_state"
 
 # Servo range in degrees (±SERVO_RANGE from center)
