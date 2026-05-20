@@ -1,41 +1,35 @@
 #!/usr/bin/env python3
 """
-SPIRE Yaw Stabilization Demo
+SPIRE Yaw Stabilization Demo v3
 Reads IMU gyro Z from shared memory, integrates to yaw angle,
-moves servo to counteract rotation.
+moves servo to counteract rotation using PID control.
+
+All PID parameters tunable from command line for easy experimentation.
 
 Requires imu_reader.py running in a separate terminal.
 
 Usage:
   Terminal 1: python3 src/imu_reader.py -r 500
   Terminal 2: python3 src/stabilize_demo.py
+  Terminal 2: python3 src/stabilize_demo.py --kp 0.8 --kd 0.1
+  Terminal 2: python3 src/stabilize_demo.py --kp 0.3 --deadband 2.0 --servo-threshold 5.0
 """
 
 import time
 import sys
 import json
 import signal
+import argparse
 import logging
 from gpiozero import Servo
 from gpiozero.pins.lgpio import LGPIOFactory
 
 # ---------------------------------------------------------------------------
-# Config
+# Constants
 # ---------------------------------------------------------------------------
 
 SERVO_PIN = 12
 IMU_SHM_NAME = "spire_imu_state"
-
-# Servo range in degrees (±SERVO_RANGE from center)
-SERVO_RANGE_DEG = 90.0
-
-# PID gains — start with P only, add I and D if needed
-KP = 0.5    # Proportional gain
-KI = 0.0    # Integral gain (0 = disabled)
-KD = 0.0    # Derivative gain (0 = disabled)
-
-# Deadband — ignore small movements below this threshold (°/s)
-GYRO_DEADBAND_DPS = 1.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,18 +50,16 @@ def setup_logging():
 
 
 # ---------------------------------------------------------------------------
-# IMU reader (from shared memory)
+# IMU reader
 # ---------------------------------------------------------------------------
 
 _imu_shm = None
 
 
 def read_imu():
-    """Read current IMU state from shared memory."""
     global _imu_shm
     try:
         from multiprocessing import shared_memory, resource_tracker
-
         if _imu_shm is None:
             _imu_shm = shared_memory.SharedMemory(
                 name=IMU_SHM_NAME, create=False
@@ -75,7 +67,6 @@ def read_imu():
             resource_tracker.unregister(
                 f"/{IMU_SHM_NAME}", "shared_memory"
             )
-
         raw = bytes(_imu_shm.buf[:_imu_shm.size]).rstrip(b'\x00')
         if raw:
             return json.loads(raw.decode("utf-8"))
@@ -87,41 +78,92 @@ def read_imu():
 
 
 # ---------------------------------------------------------------------------
-# Main stabilization loop
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="SPIRE Yaw Stabilization Demo",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+PID Tuning Guide:
+  --kp    Proportional: reacts to current error (how far off)
+          Higher = stronger response, too high = oscillation
+  --ki    Integral: reacts to accumulated error (steady-state offset)
+          Higher = eliminates drift, too high = overshoot
+  --kd    Derivative: reacts to rate of change (damping)
+          Higher = less overshoot, too high = jitter from noise
+
+Examples:
+  %(prog)s --kp 0.5                         # P-only, gentle
+  %(prog)s --kp 0.8 --kd 0.1               # PD, responsive with damping
+  %(prog)s --kp 0.5 --ki 0.05 --kd 0.1     # Full PID
+  %(prog)s --kp 0.3 --servo-threshold 5.0   # Smooth, less updates
+        """
+    )
+
+    # Hardware
+    parser.add_argument("--pin", type=int, default=SERVO_PIN,
+                        help=f"GPIO pin (default: {SERVO_PIN})")
+    parser.add_argument("--range", type=float, default=90.0,
+                        help="Servo range +/- degrees (default: 90)")
+
+    # PID gains
+    parser.add_argument("--kp", type=float, default=0.5,
+                        help="Proportional gain (default: 0.5)")
+    parser.add_argument("--ki", type=float, default=0.0,
+                        help="Integral gain (default: 0.0)")
+    parser.add_argument("--kd", type=float, default=0.0,
+                        help="Derivative gain (default: 0.0)")
+
+    # Filtering
+    parser.add_argument("--deadband", type=float, default=1.5,
+                        help="Gyro deadband in deg/s (default: 1.5)")
+    parser.add_argument("--servo-threshold", type=float, default=2.0,
+                        help="Min angle change to update servo in degrees "
+                             "(default: 2.0)")
+
+    args = parser.parse_args()
     setup_logging()
 
     log.info("=" * 40)
     log.info("SPIRE Yaw Stabilization Demo")
     log.info("=" * 40)
 
-    # Check IMU connection
+    # Check IMU
     imu = read_imu()
     if imu is None:
-        log.error("IMU not available. Start imu_reader.py first:")
-        log.error("  python3 src/imu_reader.py -r 500")
+        log.error("IMU not available. Start imu_reader.py first.")
         sys.exit(1)
     log.info("IMU connected")
 
     # Initialize servo
     factory = LGPIOFactory()
     servo = Servo(
-        SERVO_PIN,
+        args.pin,
         pin_factory=factory,
         min_pulse_width=0.5 / 1000,
         max_pulse_width=2.5 / 1000,
     )
     servo.mid()
-    log.info(f"Servo on GPIO {SERVO_PIN} — centered")
+    log.info(f"Servo on GPIO {args.pin}")
 
-    # State
-    yaw_angle = 0.0         # Integrated yaw in degrees
-    integral = 0.0          # PID integral term
-    prev_error = 0.0        # PID derivative term
+    log.info(f"PID:  Kp={args.kp}  Ki={args.ki}  Kd={args.kd}")
+    log.info(f"Deadband: {args.deadband} deg/s")
+    log.info(f"Servo threshold: {args.servo_threshold} deg")
+    log.info(f"Servo range: +/-{args.range} deg")
+    log.info("")
+    log.info("Rotate the module — servo counteracts yaw.")
+    log.info("Ctrl+C to stop.")
+    log.info("")
+
+    # PID state
+    yaw_angle = 0.0
+    integral = 0.0
+    prev_error = 0.0
+    last_servo_angle = 0.0
     last_time = time.monotonic()
-
+    last_report = time.monotonic()
     running = True
 
     def handle_signal(signum, frame):
@@ -131,20 +173,7 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    log.info("")
-    log.info(f"PID: Kp={KP}  Ki={KI}  Kd={KD}")
-    log.info(f"Servo range: ±{SERVO_RANGE_DEG}°")
-    log.info(f"Gyro deadband: {GYRO_DEADBAND_DPS} °/s")
-    log.info("")
-    log.info("Rotate the module — servo will counteract yaw rotation.")
-    log.info("Press Ctrl+C to stop.")
-    log.info("")
-
-    report_interval = 0.5
-    last_report = time.monotonic()
-
     try:
-        prev_gyro_z = 0.0
         while running:
             now = time.monotonic()
             dt = now - last_time
@@ -156,70 +185,62 @@ def main():
                 time.sleep(0.01)
                 continue
 
-            # Get yaw rate (gyro Z axis)
             gyro_z = imu.get("gyro_z", 0.0)
 
-            # Apply deadband
-            if abs(gyro_z) < GYRO_DEADBAND_DPS:
+            # Deadband — ignore noise below threshold
+            if abs(gyro_z) < args.deadband:
                 gyro_z = 0.0
 
-            # Low-pass filter — smooth out noise
-            gyro_z = gyro_z * 0.3 + prev_gyro_z * 0.7
-            prev_gyro_z = gyro_z
-
-            # Integrate gyro Z → yaw angle
+            # Integrate gyro → yaw angle
             yaw_angle += gyro_z * dt
-
-            # Clamp yaw angle to servo range
-            yaw_angle = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, yaw_angle))
+            yaw_angle = max(-args.range, min(args.range, yaw_angle))
 
             # PID controller
-            # Target: yaw_angle = 0 (counteract all rotation)
-            error = -yaw_angle  # Negative because servo must go opposite
+            # Error: how far yaw has drifted from zero
+            error = -yaw_angle
 
-            # P term
-            p_out = KP * error
+            # P: proportional to current error
+            p_out = args.kp * error
 
-            # I term
+            # I: accumulated error over time (eliminates steady-state offset)
             integral += error * dt
-            integral = max(-SERVO_RANGE_DEG, min(SERVO_RANGE_DEG, integral))
-            i_out = KI * integral
+            integral = max(-args.range, min(args.range, integral))
+            i_out = args.ki * integral
 
-            # D term
+            # D: rate of change of error (damping, reduces overshoot)
             d_out = 0.0
             if dt > 0:
-                d_out = KD * (error - prev_error) / dt
+                d_out = args.kd * (error - prev_error) / dt
             prev_error = error
 
-            # PID output in degrees
-            pid_output = p_out + i_out + d_out
+            # Combined PID output in degrees
+            servo_angle = p_out + i_out + d_out
+            servo_angle = max(-args.range, min(args.range, servo_angle))
 
-            # Convert to servo value (-1.0 to 1.0)
-            servo_value = pid_output / SERVO_RANGE_DEG
-            servo_value = max(-1.0, min(1.0, servo_value))
+            # Only update servo if change exceeds threshold
+            # Prevents constant PWM restarts that cause jitter
+            if abs(servo_angle - last_servo_angle) > args.servo_threshold:
+                servo_value = servo_angle / args.range
+                servo_value = max(-1.0, min(1.0, servo_value))
+                servo.value = servo_value
+                last_servo_angle = servo_angle
 
-            # Move servo
-            servo.value = servo_value
-
-            # Report
-            if now - last_report >= report_interval:
-                servo_angle = servo_value * SERVO_RANGE_DEG
+            # Report every 0.5s
+            if now - last_report >= 0.5:
                 log.info(
-                    f"Yaw: {yaw_angle:+7.1f}° | "
-                    f"Gyro Z: {imu.get('gyro_z', 0):+6.1f} °/s | "
-                    f"Servo: {servo_angle:+6.1f}° | "
-                    f"PID: {pid_output:+6.1f}"
+                    f"Yaw: {yaw_angle:+7.1f} deg | "
+                    f"Gyro Z: {imu.get('gyro_z', 0):+6.1f} deg/s | "
+                    f"Servo: {last_servo_angle:+6.1f} deg | "
+                    f"PID: P={p_out:+5.1f} I={i_out:+5.1f} D={d_out:+5.1f}"
                 )
                 last_report = now
 
-            # Loop rate ~100 Hz
             time.sleep(0.01)
 
     finally:
         servo.mid()
         time.sleep(0.3)
         servo.detach()
-        log.info("Servo centered and detached.")
         log.info("Done.")
 
 
