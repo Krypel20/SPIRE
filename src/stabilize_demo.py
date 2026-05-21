@@ -253,11 +253,9 @@ Examples:
                 if abs(camera_rate) < args.deadband:
                     camera_rate = 0.0
 
-                # Use platform rate as primary input
-                # Subtract camera rate as feedback correction
-                effective_rate = platform_rate - camera_rate
-
-                servo_position += direction * effective_rate * dt * args.gain
+                # Platform IMU drives servo — counteract base rotation
+                # Camera IMU is monitoring only (should read ~0 when stable)
+                servo_position += direction * platform_rate * dt * args.gain
 
             # Clamp
             servo_position = max(-args.range, min(args.range, servo_position))
