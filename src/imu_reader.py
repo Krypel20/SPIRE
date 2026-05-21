@@ -361,6 +361,8 @@ Examples:
                         help="Calibration JSON path")
     parser.add_argument("--no-cal", action="store_true",
                         help="Disable calibration (use raw values)")
+    parser.add_argument("--shm-name", type=str, default="spire_imu_state",
+                        help="Shared memory block name (default: spire_imu_state)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
 
@@ -414,7 +416,7 @@ Examples:
             log.warning(f"{info['name']} has no magnetometer")
 
     # Shared memory
-    publisher = SharedMemoryPublisher()
+    publisher = SharedMemoryPublisher(name=args.shm_name)
 
     # CSV logger
     logger = None
