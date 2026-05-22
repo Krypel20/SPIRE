@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 """
-SPIRE Yaw Stabilization — Magnetometer Heading PID
-Uses LSM9DS1 magnetometer for absolute heading reference.
-PID controller minimizes heading error between platform and reference.
+SPIRE Yaw Stabilization — Dual IMU
+Reads two IMUs via shared memory:
+  - Platform IMU (spire_imu_platform): measures capsule/base rotation
+  - Camera IMU (spire_imu_camera): measures camera orientation
 
-Modes:
-  --mode mag     Magnetometer heading PID (default, requires --mag on imu_reader)
-  --mode rate    Rate control fallback (gyro only, no magnetometer)
+Servo correction = platform rotation - camera rotation
+This eliminates the servo-fighting-itself problem.
 
-Requires imu_reader.py instances running with --mag flag for platform IMU.
+Can also run with single IMU (rate control fallback).
+
+Requires imu_reader.py instances running (or process_manager.py).
 
 Usage:
-  # T1: camera IMU (no mag needed)
-  python3 src/imu_reader.py --sensor icm20948 -r 500 --shm-name spire_imu_camera --cal config/imu_calibration.json
-
-  # T2: platform IMU WITH magnetometer
-  python3 src/imu_reader.py --sensor lsm9ds1 -a 0x6B --mag -r 200 --shm-name spire_imu_platform --cal config/lsm9ds1_calibration.json
-
-  # T3: stabilization
-  python3 src/stabilize_demo.py --kp 2.0 --kd 0.5
+  python3 stabilize_demo.py
+  python3 stabilize_demo.py --gain 5.0 --deadband 2.0
+  python3 stabilize_demo.py --single    # Single IMU fallback
 """
 
 import time
 import sys
-import math
 import json
 import signal
 import argparse
@@ -38,6 +34,7 @@ from gpiozero.pins.lgpio import LGPIOFactory
 SERVO_PIN = 12
 SHM_CAMERA = "spire_imu_camera"
 SHM_PLATFORM = "spire_imu_platform"
+SHM_SINGLE = "spire_imu_state"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,10 +55,12 @@ def setup_logging():
 
 
 # ---------------------------------------------------------------------------
-# Shared memory reader
+# Shared memory readers
 # ---------------------------------------------------------------------------
 
 class SHMReader:
+    """Read IMU state from a named shared memory block."""
+
     def __init__(self, name):
         self.name = name
         self._shm = None
@@ -87,102 +86,50 @@ class SHMReader:
 
 
 # ---------------------------------------------------------------------------
-# Heading calculation
-# ---------------------------------------------------------------------------
-
-def compute_heading(mag_x, mag_y):
-    """Compute heading from magnetometer X and Y.
-
-    For flat mounting (gravity on Z), heading is:
-      heading = atan2(mag_y, mag_x)
-
-    Returns heading in degrees, 0-360.
-    """
-    heading_rad = math.atan2(mag_y, mag_x)
-    heading_deg = math.degrees(heading_rad)
-    if heading_deg < 0:
-        heading_deg += 360
-    return heading_deg
-
-
-def heading_error(current, reference):
-    """Compute shortest angular difference between two headings.
-
-    Handles wraparound (e.g. 350° → 10° = +20°, not -340°).
-
-    Returns error in degrees, range -180 to +180.
-    """
-    err = current - reference
-    while err > 180:
-        err -= 360
-    while err < -180:
-        err += 360
-    return err
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SPIRE Yaw Stabilization — Magnetometer Heading PID",
+        description="SPIRE Yaw Stabilization — Dual IMU",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-PID Tuning:
-  --kp    Reacts to heading error (degrees off target).
-          Higher = stronger correction. Start: 1.0-2.0
-  --ki    Eliminates steady-state offset.
-          Higher = faster correction of drift. Start: 0.0-0.1
-  --kd    Damping from gyro rate. Reduces overshoot.
-          Higher = smoother stops. Start: 0.3-1.0
+Dual IMU mode (default):
+  Platform IMU detects base rotation → servo compensates.
+  Camera IMU confirms camera is stable → feedback loop.
+
+Single IMU mode (--single):
+  Rate control fallback with one IMU on camera.
 
 Examples:
-  %(prog)s --kp 2.0 --kd 0.5                    # PD control
-  %(prog)s --kp 2.0 --ki 0.05 --kd 0.5          # Full PID
-  %(prog)s --mode rate --gain 1.0 --invert       # Rate fallback
+  %(prog)s                              # Dual IMU
+  %(prog)s --gain 5.0 --deadband 2.0    # Tune response
+  %(prog)s --single                     # Single IMU fallback
+  %(prog)s --invert                     # Flip servo direction
+  %(prog)s --yaw-axis gz                # Use gyro Z for yaw (default)
         """
     )
 
-    # Mode
-    parser.add_argument("--mode", default="mag",
-                        choices=["mag", "rate"],
-                        help="Control mode (default: mag)")
-
-    # Hardware
     parser.add_argument("--pin", type=int, default=SERVO_PIN,
                         help=f"Servo GPIO pin (default: {SERVO_PIN})")
+    parser.add_argument("--gain", type=float, default=5.0,
+                        help="Rate gain (default: 5.0)")
+    parser.add_argument("--deadband", type=float, default=1.5,
+                        help="Gyro deadband deg/s (default: 1.5)")
+    parser.add_argument("--threshold", type=float, default=2.0,
+                        help="Min servo angle change deg (default: 2.0)")
     parser.add_argument("--range", type=float, default=135.0,
                         help="Servo range +/- degrees (default: 135)")
-
-    # PID gains (mag mode)
-    parser.add_argument("--kp", type=float, default=1.5,
-                        help="Proportional gain (default: 1.5)")
-    parser.add_argument("--ki", type=float, default=0.0,
-                        help="Integral gain (default: 0.0)")
-    parser.add_argument("--kd", type=float, default=0.5,
-                        help="Derivative gain (default: 0.5)")
-
-    # Rate mode params
-    parser.add_argument("--gain", type=float, default=1.0,
-                        help="Rate mode gain (default: 1.0)")
-
-    # Filtering
-    parser.add_argument("--deadband", type=float, default=0.5,
-                        help="Gyro deadband deg/s (default: 0.5)")
-    parser.add_argument("--threshold", type=float, default=1.0,
-                        help="Min servo change deg (default: 1.0)")
-    parser.add_argument("--heading-deadband", type=float, default=1.0,
-                        help="Heading error deadband deg (default: 1.0)")
-
-    # Direction
     parser.add_argument("--invert", action="store_true",
                         help="Invert servo direction")
-
-    # Yaw axis (rate mode)
+    parser.add_argument("--single", action="store_true",
+                        help="Single IMU mode (rate control)")
     parser.add_argument("--platform-yaw", default="gz",
                         choices=["gx", "gy", "gz"],
                         help="Platform IMU yaw axis (default: gz)")
+    parser.add_argument("--camera-yaw", default="gz",
+                        choices=["gx", "gy", "gz"],
+                        help="Camera IMU yaw axis (default: gz)")
 
     args = parser.parse_args()
     setup_logging()
@@ -191,28 +138,42 @@ Examples:
     log.info("SPIRE Yaw Stabilization")
     log.info("=" * 40)
 
-    # Connect shared memory
-    shm_platform = SHMReader(SHM_PLATFORM)
-    shm_camera = SHMReader(SHM_CAMERA)
+    # Axis mapping
+    axis_map = {"gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z"}
+    platform_yaw_key = axis_map[args.platform_yaw]
+    camera_yaw_key = axis_map[args.camera_yaw]
 
-    plat = shm_platform.read()
-    if plat is None:
-        log.error("Platform IMU not available.")
-        sys.exit(1)
-    log.info("Platform IMU connected")
+    # Connect to shared memory
+    if args.single:
+        log.info("Mode: Single IMU (rate control)")
+        shm_camera = SHMReader(SHM_SINGLE)
+        shm_platform = None
 
-    cam = shm_camera.read()
-    if cam is not None:
+        imu = shm_camera.read()
+        if imu is None:
+            log.error("IMU not available. Start imu_reader.py first.")
+            sys.exit(1)
         log.info("Camera IMU connected")
     else:
-        log.info("Camera IMU not available (monitoring disabled)")
+        log.info("Mode: Dual IMU (platform + camera)")
+        shm_platform = SHMReader(SHM_PLATFORM)
+        shm_camera = SHMReader(SHM_CAMERA)
 
-    # Check magnetometer data
-    if args.mode == "mag":
-        if plat.get("mag_x", 0) == 0 and plat.get("mag_y", 0) == 0:
-            log.error("No magnetometer data. Start platform imu_reader with --mag")
-            log.error("Falling back to rate mode.")
-            args.mode = "rate"
+        plat = shm_platform.read()
+        cam = shm_camera.read()
+
+        if plat is None:
+            log.error(f"Platform IMU not available ({SHM_PLATFORM}).")
+            log.error("Start: imu_reader.py --sensor lsm9ds1 "
+                      "--shm-name spire_imu_platform")
+            sys.exit(1)
+        if cam is None:
+            log.error(f"Camera IMU not available ({SHM_CAMERA}).")
+            log.error("Start: imu_reader.py --sensor icm20948 "
+                      "--shm-name spire_imu_camera")
+            sys.exit(1)
+        log.info("Platform IMU connected")
+        log.info("Camera IMU connected")
 
     # Initialize servo
     factory = LGPIOFactory()
@@ -224,19 +185,11 @@ Examples:
     )
     servo.mid()
 
-    direction = -1.0 if not args.invert else 1.0
-    axis_map = {"gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z"}
-    platform_yaw_key = axis_map[args.platform_yaw]
-
-    if args.mode == "mag":
-        log.info(f"Mode: Magnetometer Heading PID")
-        log.info(f"PID: Kp={args.kp}  Ki={args.ki}  Kd={args.kd}")
-    else:
-        log.info(f"Mode: Rate Control")
-        log.info(f"Gain: {args.gain}  Yaw axis: {args.platform_yaw}")
-
-    log.info(f"Servo GPIO {args.pin}  Range: +/-{args.range}")
-    log.info(f"Deadband: {args.deadband} deg/s  Threshold: {args.threshold} deg")
+    log.info(f"Servo on GPIO {args.pin}")
+    log.info(f"Gain: {args.gain}  Deadband: {args.deadband} deg/s  "
+             f"Threshold: {args.threshold} deg")
+    log.info(f"Platform yaw axis: {args.platform_yaw}  "
+             f"Camera yaw axis: {args.camera_yaw}")
     log.info(f"Invert: {'yes' if args.invert else 'no'}")
     log.info("")
     log.info("Ctrl+C to stop.")
@@ -245,11 +198,10 @@ Examples:
     # State
     servo_position = 0.0
     last_sent_position = 0.0
-    integral = 0.0
-    heading_ref = None
     last_time = time.monotonic()
     last_report = time.monotonic()
     running = True
+    direction = -1.0 if not args.invert else 1.0
 
     def handle_signal(signum, frame):
         nonlocal running
@@ -263,88 +215,50 @@ Examples:
             now = time.monotonic()
             dt = now - last_time
             last_time = now
+
             if dt > 0.1:
                 dt = 0.01
 
-            plat = shm_platform.read()
-            if plat is None:
-                time.sleep(0.01)
-                continue
-
-            cam = shm_camera.read() if shm_camera else None
-
-            if args.mode == "mag":
-                # --- Magnetometer Heading PID ---
-
-                mag_x = plat.get("mag_x", 0)
-                mag_y = plat.get("mag_y", 0)
-                gyro_rate = plat.get("gyro_z", 0.0)
-
-                # Compute current heading
-                current_heading = compute_heading(mag_x, mag_y)
-
-                # Set reference on first valid reading
-                if heading_ref is None:
-                    heading_ref = current_heading
-                    log.info(f"Reference heading set: {heading_ref:.1f} deg")
+            if args.single:
+                # Single IMU: rate control
+                imu = shm_camera.read()
+                if imu is None:
+                    time.sleep(0.01)
                     continue
 
-                # Heading error
-                error = heading_error(current_heading, heading_ref)
+                gyro_rate = imu.get(camera_yaw_key, 0.0)
 
-                # Heading deadband
-                if abs(error) < args.heading_deadband:
-                    error = 0.0
-
-                # PID
-                # P: proportional to heading error
-                p_out = args.kp * error
-
-                # I: accumulated heading error
-                integral += error * dt
-                integral = max(-args.range, min(args.range, integral))
-                i_out = args.ki * integral
-
-                # D: damping from gyro rate (not heading derivative)
-                # Gyro gives cleaner rate signal than differentiating heading
-                if abs(gyro_rate) < args.deadband:
-                    gyro_rate = 0.0
-                d_out = args.kd * gyro_rate
-
-                # Combine
-                servo_position = direction * (p_out + i_out + d_out)
-                servo_position = max(-args.range, min(args.range, servo_position))
-
-                # Report
-                if now - last_report >= 0.5:
-                    cam_gz = cam.get("gyro_z", 0) if cam else 0
-                    log.info(
-                        f"Heading: {current_heading:5.1f} deg | "
-                        f"Ref: {heading_ref:5.1f} deg | "
-                        f"Error: {error:+6.1f} deg | "
-                        f"Servo: {last_sent_position:+6.1f} deg | "
-                        f"Camera gz: {cam_gz:+6.1f} deg/s"
-                    )
-                    last_report = now
-
-            else:
-                # --- Rate Control Fallback ---
-
-                gyro_rate = plat.get(platform_yaw_key, 0.0)
                 if abs(gyro_rate) < args.deadband:
                     gyro_rate = 0.0
 
                 servo_position += direction * gyro_rate * dt * args.gain
-                servo_position = max(-args.range, min(args.range, servo_position))
 
-                if now - last_report >= 0.5:
-                    cam_gz = cam.get("gyro_z", 0) if cam else 0
-                    log.info(
-                        f"Platform: {plat.get(platform_yaw_key, 0):+6.1f} deg/s | "
-                        f"Camera: {cam_gz:+6.1f} deg/s | "
-                        f"Servo: {last_sent_position:+6.1f} deg"
-                    )
-                    last_report = now
+            else:
+                # Dual IMU: platform rotation drives servo,
+                # camera IMU confirms stabilization
+                plat = shm_platform.read()
+                cam = shm_camera.read()
+
+                if plat is None or cam is None:
+                    time.sleep(0.01)
+                    continue
+
+                platform_rate = plat.get(platform_yaw_key, 0.0)
+                camera_rate = cam.get(camera_yaw_key, 0.0)
+
+                # Platform rotation is the disturbance to counteract
+                # Camera rotation is what we want to minimize
+                if abs(platform_rate) < args.deadband:
+                    platform_rate = 0.0
+                if abs(camera_rate) < args.deadband:
+                    camera_rate = 0.0
+
+                # Platform IMU drives servo — counteract base rotation
+                # Camera IMU is monitoring only (should read ~0 when stable)
+                servo_position += direction * platform_rate * dt * args.gain
+
+            # Clamp
+            servo_position = max(-args.range, min(args.range, servo_position))
 
             # Update servo if change significant
             if abs(servo_position - last_sent_position) > args.threshold:
@@ -353,11 +267,28 @@ Examples:
                 servo.value = servo_value
                 last_sent_position = servo_position
 
+            # Report
+            if now - last_report >= 0.5:
+                if args.single:
+                    log.info(
+                        f"Gyro: {imu.get(camera_yaw_key, 0):+6.1f} deg/s | "
+                        f"Servo: {last_sent_position:+6.1f} deg"
+                    )
+                else:
+                    log.info(
+                        f"Platform: {plat.get(platform_yaw_key, 0):+6.1f} deg/s | "
+                        f"Camera: {cam.get(camera_yaw_key, 0):+6.1f} deg/s | "
+                        f"Servo: {last_sent_position:+6.1f} deg"
+                    )
+                last_report = now
+
             time.sleep(0.01)
 
     finally:
+        servo.mid()
+        time.sleep(0.3)
         servo.detach()
-        log.info("Servo detached. Done.")
+        log.info("Done.")
 
 
 if __name__ == "__main__":
