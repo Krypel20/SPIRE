@@ -98,7 +98,8 @@ def compute_heading(mag_x, mag_y, mag_z=0, accel_x=None, accel_y=None, accel_z=N
 
     Returns heading in degrees, 0-360.
     """
-    if accel_x is not None and accel_z is not None and abs(accel_z) > 0.1:
+    # if accel_x is not None and accel_z is not None and abs(accel_z) > 0.1:
+    if False:  # Tilt compensation disabled, needs fix for upside-down mounting (TODO)
         pitch = math.atan2(accel_x, accel_z)
         roll = math.atan2(accel_y, accel_z)
 
