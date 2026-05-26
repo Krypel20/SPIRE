@@ -319,18 +319,36 @@ Examples:
                     pass
                 else:
                     # Active correction needed
+                    abs_error = abs(error)
+
+                    # Gain scheduling: KD adapts to error magnitude
+                    # Small error → gentle (kd_low), large error → aggressive (kd_high)
+                    kd_low = 0.4
+                    kd_high = 0.8
+                    error_low = 5.0           # Below this: calm
+                    error_high = 15.0         # Above this: aggressive
+
+                    if abs_error <= error_low:
+                        kd_active = kd_low
+                    elif abs_error >= error_high:
+                        kd_active = kd_high
+                    else:
+                        # Linear interpolation
+                        t = (abs_error - error_low) / (error_high - error_low)
+                        kd_active = kd_low + t * (kd_high - kd_low)
+
                     # P: proportional to heading error
                     p_out = args.kp * error
 
-                    # I: accumulated heading error
+                    # I: accumulated heading error (eliminates residual offset)
                     integral += error * dt
                     integral = max(-args.range, min(args.range, integral))
                     i_out = args.ki * integral
 
-                    # D: damping from gyro rate
+                    # D: damping from gyro rate with adaptive gain
                     if abs(gyro_rate) < args.deadband:
                         gyro_rate = 0.0
-                    d_out = args.kd * gyro_rate
+                    d_out = kd_active * gyro_rate
 
                     # Combine
                     servo_position = direction * (p_out + i_out + d_out)
