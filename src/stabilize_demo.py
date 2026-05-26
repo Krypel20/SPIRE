@@ -90,15 +90,32 @@ class SHMReader:
 # Heading calculation
 # ---------------------------------------------------------------------------
 
-def compute_heading(mag_x, mag_y):
-    """Compute heading from magnetometer X and Y.
+def compute_heading(mag_x, mag_y, mag_z=0, accel_x=None, accel_y=None, accel_z=None):
+    """Compute tilt-compensated heading from magnetometer and accelerometer.
 
-    For flat mounting (gravity on Z), heading is:
-      heading = atan2(mag_y, mag_x)
+    Without accelerometer: simple atan2 (assumes flat).
+    With accelerometer: corrects for platform tilt (pitch/roll).
 
     Returns heading in degrees, 0-360.
     """
-    heading_rad = math.atan2(mag_y, mag_x)
+    if accel_x is not None and accel_z is not None and abs(accel_z) > 0.1:
+        pitch = math.atan2(accel_x, accel_z)
+        roll = math.atan2(accel_y, accel_z)
+
+        cos_p = math.cos(pitch)
+        sin_p = math.sin(pitch)
+        cos_r = math.cos(roll)
+        sin_r = math.sin(roll)
+
+        mag_x_comp = mag_x * cos_p + mag_z * sin_p
+        mag_y_comp = (mag_y * cos_r
+                      + mag_z * sin_r * sin_p
+                      - mag_x * sin_r)
+
+        heading_rad = math.atan2(mag_y_comp, mag_x_comp)
+    else:
+        heading_rad = math.atan2(mag_y, mag_x)
+
     heading_deg = math.degrees(heading_rad)
     if heading_deg < 0:
         heading_deg += 360
@@ -282,7 +299,13 @@ Examples:
                 gyro_rate = plat.get("gyro_z", 0.0)
 
                 # Raw magnetometer heading
-                mag_heading = compute_heading(mag_x, mag_y)
+                mag_heading = compute_heading(
+                    mag_x, mag_y,
+                    mag_z=plat.get("mag_z", 0),
+                    accel_x=plat.get("accel_x", None),
+                    accel_y=plat.get("accel_y", None),
+                    accel_z=plat.get("accel_z", None),
+                )
 
                 # Set reference on first valid reading
                 if heading_ref is None:
