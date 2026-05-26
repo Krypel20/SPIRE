@@ -294,26 +294,27 @@ Examples:
 
                 # Heading deadband
                 if abs(error) < args.heading_deadband:
-                    error = 0.0
+                    # Camera is close to target — hold position, no corrections
+                    # This prevents servo vibrations from feeding back through gyro
+                    pass
+                else:
+                    # Active correction needed
+                    # P: proportional to heading error
+                    p_out = args.kp * error
 
-                # PID
-                # P: proportional to heading error
-                p_out = args.kp * error
+                    # I: accumulated heading error
+                    integral += error * dt
+                    integral = max(-args.range, min(args.range, integral))
+                    i_out = args.ki * integral
 
-                # I: accumulated heading error
-                integral += error * dt
-                integral = max(-args.range, min(args.range, integral))
-                i_out = args.ki * integral
+                    # D: damping from gyro rate
+                    if abs(gyro_rate) < args.deadband:
+                        gyro_rate = 0.0
+                    d_out = args.kd * gyro_rate
 
-                # D: damping from gyro rate (not heading derivative)
-                # Gyro gives cleaner rate signal than differentiating heading
-                if abs(gyro_rate) < args.deadband:
-                    gyro_rate = 0.0
-                d_out = args.kd * gyro_rate
-
-                # Combine
-                servo_position = direction * (p_out + i_out + d_out)
-                servo_position = max(-args.range, min(args.range, servo_position))
+                    # Combine
+                    servo_position = direction * (p_out + i_out + d_out)
+                    servo_position = max(-args.range, min(args.range, servo_position))
 
                 # Report
                 if now - last_report >= 0.5:
