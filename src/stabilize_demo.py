@@ -247,6 +247,7 @@ Examples:
     last_sent_position = 0.0
     integral = 0.0
     heading_ref = None
+    filtered_heading = None
     last_time = time.monotonic()
     last_report = time.monotonic()
     running = True
@@ -280,18 +281,37 @@ Examples:
                 mag_y = plat.get("mag_y", 0)
                 gyro_rate = plat.get("gyro_z", 0.0)
 
-                # Compute current heading
-                current_heading = compute_heading(mag_x, mag_y)
+                # Raw magnetometer heading
+                mag_heading = compute_heading(mag_x, mag_y)
 
                 # Set reference on first valid reading
                 if heading_ref is None:
-                    heading_ref = current_heading
+                    heading_ref = mag_heading
+                    filtered_heading = mag_heading
                     log.info(f"Reference heading set: {heading_ref:.1f} deg")
                     continue
 
+                # Complementary filter:
+                # Gyro: smooth, fast, no tilt error, but drifts
+                # Magnetometer: noisy, tilt-sensitive, but absolute
+                # Blend: 98% gyro + 2% magnetometer
+                alpha = 0.02
+
+                # Gyro integration
+                gyro_heading = filtered_heading + gyro_rate * dt
+
+                # Magnetometer correction (handle 360/0 wraparound)
+                mag_diff = heading_error(mag_heading, gyro_heading)
+                filtered_heading = gyro_heading + alpha * mag_diff
+
+                # Normalize to 0-360
+                filtered_heading = filtered_heading % 360
+
+                # Use filtered heading instead of raw magnetometer
+                current_heading = filtered_heading
+
                 # Heading error
                 error = heading_error(current_heading, heading_ref)
-
                 # Heading deadband
                 if abs(error) < args.heading_deadband:
                     # Camera is close to target — hold position, no corrections
