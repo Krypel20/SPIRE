@@ -209,16 +209,18 @@ class Camera:
             log.info("Camera closed")
 
 class PreviewServer:
-    """Background MJPEG streaming server."""
+    """Background MJPEG streaming server with photo gallery."""
 
-    def __init__(self, camera, port=8080):
+    def __init__(self, camera, output_dir, port=8080):
         self.camera = camera
+        self.output_dir = output_dir
         self.port = port
         self.server = None
         self.thread = None
 
     def start(self):
         cam = self.camera
+        output_dir = self.output_dir
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -227,9 +229,36 @@ class PreviewServer:
                     self.send_header("Content-Type", "text/html")
                     self.end_headers()
                     self.wfile.write(b"""
-                    <html><body style="margin:0;background:#000">
-                    <img src="/stream" style="width:100%;height:auto">
+                    <html><head>
+                    <title>SPIRE Preview</title>
+                    <style>
+                      body { margin:0; background:#111; color:#eee; font-family:monospace; }
+                      .container { display:flex; height:100vh; }
+                      .stream { flex:2; display:flex; align-items:center; justify-content:center; }
+                      .stream img { max-width:100%; max-height:100%; }
+                      .gallery { flex:1; overflow-y:auto; padding:10px; border-left:2px solid #333; }
+                      .gallery h3 { margin:0 0 10px; color:#0ff; }
+                      .gallery img { width:100%; margin-bottom:8px; cursor:pointer; border:1px solid #333; }
+                      .gallery img:hover { border-color:#0ff; }
+                    </style>
+                    <script>
+                      function refreshGallery() {
+                        fetch('/photos').then(r=>r.text()).then(html=>{
+                          document.getElementById('photos').innerHTML=html;
+                        });
+                      }
+                      setInterval(refreshGallery, 5000);
+                    </script>
+                    </head><body>
+                    <div class="container">
+                      <div class="stream"><img src="/stream"></div>
+                      <div class="gallery">
+                        <h3>Captured Photos</h3>
+                        <div id="photos">Loading...</div>
+                      </div>
+                    </div>
                     </body></html>""")
+
                 elif self.path == "/stream":
                     self.send_response(200)
                     self.send_header("Content-Type",
@@ -246,14 +275,42 @@ class PreviewServer:
                             self.wfile.write(b"\r\n")
                             self.wfile.write(frame)
                             self.wfile.write(b"\r\n")
-                            time.sleep(0.2)  # ~5 fps preview
+                            time.sleep(0.2)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
+
+                elif self.path == "/photos":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    photos = sorted(
+                        [f for f in os.listdir(output_dir) if f.endswith(".jpg")],
+                        reverse=True
+                    ) if os.path.exists(output_dir) else []
+                    html = ""
+                    for p in photos[:20]:
+                        html += f'<a href="/photo/{p}" target="_blank">'
+                        html += f'<img src="/photo/{p}" title="{p}"></a>\n'
+                    if not photos:
+                        html = "<p>No photos yet</p>"
+                    self.wfile.write(html.encode())
+
+                elif self.path.startswith("/photo/"):
+                    filename = self.path[7:]
+                    filepath = os.path.join(output_dir, filename)
+                    if os.path.exists(filepath) and filename.endswith(".jpg"):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.end_headers()
+                        with open(filepath, "rb") as f:
+                            self.wfile.write(f.read())
+                    else:
+                        self.send_error(404)
                 else:
                     self.send_error(404)
 
             def log_message(self, format, *args):
-                pass  # Suppress HTTP logs
+                pass
 
         self.server = HTTPServer(("0.0.0.0", self.port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -536,7 +593,7 @@ Examples:
     # Preview server 
     preview = None
     if args.preview and camera:
-        preview = PreviewServer(camera, port=args.preview_port)
+        preview = PreviewServer(camera, args.output, port=args.preview_port)
         preview.start()
 
     # Initialize PID
