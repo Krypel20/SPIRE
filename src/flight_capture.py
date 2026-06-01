@@ -28,7 +28,9 @@ import subprocess
 import argparse
 import logging
 from datetime import datetime, timezone
-
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import io
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -206,7 +208,62 @@ class Camera:
             self.cam.close()
             log.info("Camera closed")
 
+class PreviewServer:
+    """Background MJPEG streaming server."""
 
+    def __init__(self, camera, port=8080):
+        self.camera = camera
+        self.port = port
+        self.server = None
+        self.thread = None
+
+    def start(self):
+        cam = self.camera
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(b"""
+                    <html><body style="margin:0;background:#000">
+                    <img src="/stream" style="width:100%;height:auto">
+                    </body></html>""")
+                elif self.path == "/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "multipart/x-mixed-replace; boundary=frame")
+                    self.end_headers()
+                    try:
+                        while True:
+                            buf = io.BytesIO()
+                            cam.cam.capture_file(buf, format="jpeg")
+                            frame = buf.getvalue()
+                            self.wfile.write(b"--frame\r\n")
+                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                            self.wfile.write(f"Content-Length: {len(frame)}\r\n".encode())
+                            self.wfile.write(b"\r\n")
+                            self.wfile.write(frame)
+                            self.wfile.write(b"\r\n")
+                            time.sleep(0.2)  # ~5 fps preview
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                else:
+                    self.send_error(404)
+
+            def log_message(self, format, *args):
+                pass  # Suppress HTTP logs
+
+        self.server = HTTPServer(("0.0.0.0", self.port), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        log.info(f"Preview: http://<rpi-ip>:{self.port}")
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            
 # ---------------------------------------------------------------------------
 # Servo
 # ---------------------------------------------------------------------------
@@ -390,6 +447,10 @@ Examples:
                         help="Number of photos, 0=infinite (default: 0)")
     parser.add_argument("-o", "--output", default="data/flight",
                         help="Output directory (default: data/flight)")
+    parser.add_argument("--preview", action="store_true",
+                        help="Enable MJPEG live preview on port 8080")
+    parser.add_argument("--preview-port", type=int, default=8080,
+                        help="Preview server port (default: 8080)")
 
     # Stabilization timing
     parser.add_argument("--stabilize-time", type=float, default=2.0,
@@ -471,6 +532,12 @@ Examples:
     if not args.no_camera:
         camera = Camera(args.output)
         camera.init()
+        
+    # Preview server 
+    preview = None
+    if args.preview and camera:
+        preview = PreviewServer(camera, port=args.preview_port)
+        preview.start()
 
     # Initialize PID
     pid = StabilizationPID(
@@ -592,6 +659,8 @@ Examples:
         log.info("")
         log.info("Shutting down...")
         servo.close()
+        if preview:
+            preview.stop()
         if camera:
             camera.close()
         imu_camera.stop()
