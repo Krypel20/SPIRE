@@ -243,11 +243,16 @@ class PreviewServer:
                     </style>
                     <script>
                       function refreshGallery() {
-                        fetch('/photos').then(r=>r.text()).then(html=>{
-                          document.getElementById('photos').innerHTML=html;
-                        });
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', '/photos', true);
+                        xhr.onload = function() {
+                          if (xhr.status === 200) {
+                            document.getElementById('photos').innerHTML = xhr.responseText;
+                          }
+                        };
+                        xhr.send();
                       }
-                      setInterval(refreshGallery, 5000);
+                      window.onload = function() { refreshGallery(); setInterval(refreshGallery, 5000); };
                     </script>
                     </head><body>
                     <div class="container">
