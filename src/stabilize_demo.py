@@ -240,7 +240,7 @@ Examples:
         min_pulse_width=0.5 / 1000,
         max_pulse_width=2.5 / 1000,
     )
-    servo.mid()
+    servo.detach()
 
     direction = -1.0 if not args.invert else 1.0
     axis_map = {"gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z"}
