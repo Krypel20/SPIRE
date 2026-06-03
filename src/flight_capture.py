@@ -30,6 +30,11 @@ import logging
 from datetime import datetime, timezone
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    
 import io
 # ---------------------------------------------------------------------------
 # Logging
@@ -326,7 +331,7 @@ class PreviewServer:
             def log_message(self, format, *args):
                 pass
 
-        self.server = HTTPServer(("0.0.0.0", self.port), Handler)
+        self.server = ThreadedHTTPServer(("0.0.0.0", self.port), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         log.info(f"Preview: http://<rpi-ip>:{self.port}")
