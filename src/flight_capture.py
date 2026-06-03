@@ -236,31 +236,13 @@ class PreviewServer:
                       .container { display:flex; height:100vh; }
                       .stream { flex:2; display:flex; align-items:center; justify-content:center; }
                       .stream img { max-width:100%; max-height:100%; }
-                      .gallery { flex:1; overflow-y:auto; padding:10px; border-left:2px solid #333; }
-                      .gallery h3 { margin:0 0 10px; color:#0ff; }
-                      .gallery img { width:100%; margin-bottom:8px; cursor:pointer; border:1px solid #333; }
-                      .gallery img:hover { border-color:#0ff; }
+                      .gallery { flex:1; border-left:2px solid #333; }
+                      .gallery iframe { width:100%; height:100%; border:none; }
                     </style>
-                    <script>
-                      function refreshGallery() {
-                        var xhr = new XMLHttpRequest();
-                        xhr.open('GET', '/photos', true);
-                        xhr.onload = function() {
-                          if (xhr.status === 200) {
-                            document.getElementById('photos').innerHTML = xhr.responseText;
-                          }
-                        };
-                        xhr.send();
-                      }
-                      window.onload = function() { refreshGallery(); setInterval(refreshGallery, 5000); };
-                    </script>
                     </head><body>
                     <div class="container">
                       <div class="stream"><img src="/stream"></div>
-                      <div class="gallery">
-                        <h3>Captured Photos</h3>
-                        <div id="photos">Loading...</div>
-                      </div>
+                      <div class="gallery"><iframe src="/gallery"></iframe></div>
                     </div>
                     </body></html>""")
 
@@ -311,6 +293,33 @@ class PreviewServer:
                             self.wfile.write(f.read())
                     else:
                         self.send_error(404)
+                        
+                elif self.path == "/gallery":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    photos = sorted(
+                        [f for f in os.listdir(output_dir) if f.endswith(".jpg")],
+                        reverse=True
+                    ) if os.path.exists(output_dir) else []
+                    html = """<html><head>
+                    <meta http-equiv="refresh" content="5">
+                    <style>
+                      body { margin:10px; background:#111; color:#eee; font-family:monospace; }
+                      h3 { color:#0ff; margin:0 0 10px; }
+                      img { width:100%; margin-bottom:8px; border:1px solid #333; }
+                      .info { font-size:11px; color:#888; margin-bottom:5px; }
+                    </style>
+                    </head><body>
+                    <h3>Photos (""" + str(len(photos)) + """)</h3>"""
+                    for p in photos[:20]:
+                        html += f'<div class="info">{p}</div>'
+                        html += f'<a href="/photo/{p}" target="_blank">'
+                        html += f'<img src="/photo/{p}"></a>\n'
+                    if not photos:
+                        html += "<p>No photos yet</p>"
+                    html += "</body></html>"
+                    self.wfile.write(html.encode())
                 else:
                     self.send_error(404)
 
