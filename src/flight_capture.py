@@ -50,6 +50,17 @@ def setup_logging(verbose=False):
     console.setFormatter(fmt)
     log.setLevel(logging.DEBUG)
     log.addHandler(console)
+
+class StreamingOutput(io.BufferedIOBase):
+    """MJPEG frame buffer for preview streaming."""
+    def __init__(self):
+        self.frame = None
+        self.condition = threading.Condition()
+
+    def write(self, buf):
+        with self.condition:
+            self.frame = buf
+            self.condition.notify_all()
  
 # ---------------------------------------------------------------------------
 # Shared memory reader
@@ -163,13 +174,18 @@ class Camera:
  
     def init(self):
         from picamera2 import Picamera2
+        from picamera2.encoders import MJPEGEncoder
+        from picamera2.outputs import FileOutput
         self.cam = Picamera2()
         config = self.cam.create_still_configuration(
             main={"size": (4056, 3040)},
             lores={"size": (800, 600)},
         )
         self.cam.configure(config)
-        self.cam.start()
+        self.streaming_output = StreamingOutput()
+        self.cam.start_recording(
+            MJPEGEncoder(), FileOutput(self.streaming_output), name="lores"
+        )
         time.sleep(1)
         log.info("Camera initialized")
  
@@ -189,7 +205,7 @@ class Camera:
  
     def close(self):
         if self.cam:
-            self.cam.stop()
+            self.cam.stop_recording()
             self.cam.close()
             log.info("Camera closed")
  
@@ -267,23 +283,18 @@ class PreviewServer:
                 elif self.path == "/stream":
                     self.send_response(200)
                     self.send_header("Content-Type",
-                                     "multipart/x-mixed-replace; boundary=frame")
+                                    "multipart/x-mixed-replace; boundary=frame")
                     self.end_headers()
                     try:
                         while True:
-                            frame_arr = cam.cam.capture_array("lores")
-                            from PIL import Image
-                            img = Image.fromarray(frame_arr)
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG", quality=70)
-                            frame = buf.getvalue()
+                            with cam.streaming_output.condition:
+                                cam.streaming_output.condition.wait()
+                                frame = cam.streaming_output.frame
                             self.wfile.write(b"--frame\r\n")
                             self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                            self.wfile.write(f"Content-Length: {len(frame)}\r\n".encode())
-                            self.wfile.write(b"\r\n")
+                            self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
                             self.wfile.write(frame)
                             self.wfile.write(b"\r\n")
-                            time.sleep(0.033)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
  
