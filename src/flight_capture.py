@@ -543,6 +543,35 @@ class StabilizationPID:
         return (servo_angle, error, is_correcting)
  
 # ---------------------------------------------------------------------------
+# PID thread — runs servo independently of capture timing
+# ---------------------------------------------------------------------------
+
+class PIDThread(threading.Thread):
+    """Continuous PID servo control, independent of capture sequence."""
+
+    def __init__(self, pid, servo, shm_platform):
+        super().__init__(daemon=True)
+        self.pid = pid
+        self.servo = servo
+        self.shm_platform = shm_platform
+        self._stop_event = threading.Event()
+        self.last_error = 0.0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            plat = self.shm_platform.read()
+            result = self.pid.update(plat)
+            if result:
+                servo_angle, error, _ = result
+                self.last_error = error
+                self.servo.set_position(servo_angle)
+            time.sleep(0.01)
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=1.0)
+
+# ---------------------------------------------------------------------------
 # Rotation speed measurement
 # ---------------------------------------------------------------------------
  
@@ -620,8 +649,10 @@ Examples:
     # Timing
     parser.add_argument("--stabilize-time", type=float, default=2.0,
                         help="Min stabilization time before gate (default: 2.0)")
-    parser.add_argument("--settle-time", type=float, default=0.15,
-                    help="Wait after servo freeze before capture (default: 0.15s)")
+    parser.add_argument("--cam-gyro-threshold", type=float, default=20.0,
+                        help="Max |cam gyro_z| deg/s to trigger capture (default: 20.0)")
+    parser.add_argument("--cam-stable-count", type=int, default=5,
+                        help="Consecutive stable samples before capture (default: 5)")
     parser.add_argument("--center-time", type=float, default=1.5,
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
@@ -675,9 +706,10 @@ Examples:
     log.info("=" * 50)
     log.info("SPIRE Flight Capture v2.1")
     log.info("=" * 50)
-    log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s | Settle: {args.settle_time}s")
+    log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s | "
+            f"Cam threshold: {args.cam_gyro_threshold} deg/s x{args.cam_stable_count}")
     log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
-         f"KI={args.ki}")
+            f"KI={args.ki}")
     log.info("")
  
     # Start IMU readers
@@ -758,7 +790,7 @@ Examples:
  
             # --- Phase 1: Wait (servo detached) ---
             wait_time = max(0, args.interval - args.stabilize_time
-               - args.settle_time - args.center_time
+               - args.gate_timeout - args.center_time
                - args.measure_time - 0.5)
             log.info(f"[Cycle {frame_id}] Waiting {wait_time:.1f}s...")
  
@@ -797,38 +829,55 @@ Examples:
 
             log.info(f"[Cycle {frame_id}] Stabilize + capture...")
 
-            # --- Phases 3+4: PID stabilization then capture ---
-            phase_end = time.monotonic() + args.stabilize_time
-            last_error = 0.0
-            plat = None
+            # --- Phase 3: PID thread starts, runs servo independently ---
+            pid_thread = PIDThread(pid, servo, shm_platform)
+            pid_thread.start()
+
+            # Minimum stabilization window before monitoring
+            stab_end = time.monotonic() + args.stabilize_time
+            while running and time.monotonic() < stab_end:
+                time.sleep(0.01)
+
+            if not running:
+                pid_thread.stop()
+                break
+
+            # --- Phase 4: Monitor cam_gz, capture when camera is stable ---
+            cam_stable_count = 0
+            capture_deadline = time.monotonic() + args.gate_timeout
+            captured = False
             cam_data = None
 
-            while running and time.monotonic() < phase_end:
-                plat = shm_platform.read()
+            while running and time.monotonic() < capture_deadline:
                 cam_data = shm_camera.read()
-                result = pid.update(plat)
-                if not result:
-                    time.sleep(0.01)
-                    continue
-                servo_angle, error, _ = result
-                last_error = error
-                servo.set_position(servo_angle)
+                cam_gz_abs = abs(cam_data.get("gyro_z", 999.0)) if cam_data else 999.0
+
+                if cam_gz_abs < args.cam_gyro_threshold:
+                    cam_stable_count += 1
+                else:
+                    cam_stable_count = 0
+
+                if cam_stable_count >= args.cam_stable_count:
+                    captured = True
+                    break
+
                 time.sleep(0.01)
+
+            # Freeze servo at compensation angle
+            pid_thread.stop()
 
             if not running:
                 break
 
-            # Servo frozen at compensation angle — wait for physical settle
-            time.sleep(args.settle_time)
-
-            # Capture while servo holds position
+            # Snapshot state and capture
             plat = shm_platform.read()
             cam_data = shm_camera.read()
-            plat_gz = plat.get("gyro_z", 0) if plat else 0
-            cam_gz = cam_data.get("gyro_z", 0) if cam_data else 0
+            plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
+            cam_gz = cam_data.get("gyro_z", 0.0) if cam_data else 0.0
+            status = "STABLE" if captured else "TIMEOUT"
             log.info(
-                f"[Cycle {frame_id}] Capture "
-                f"error:{last_error:+.1f} deg, "
+                f"[Cycle {frame_id}] Capture [{status}] "
+                f"error:{pid_thread.last_error:+.1f} deg, "
                 f"servo:{servo.last_sent:+.1f} deg, "
                 f"plat_gz:{plat_gz:+.1f} deg/s, "
                 f"cam_gz:{cam_gz:+.1f} deg/s"
@@ -837,9 +886,11 @@ Examples:
                 "frame_id": frame_id,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "capture_mono_ns": time.monotonic_ns(),
+                "capture_status": status,
+                "cam_stable_count": cam_stable_count,
                 "heading_ref": pid.heading_ref,
                 "heading_current": pid.filtered_heading,
-                "heading_error": last_error,
+                "heading_error": pid_thread.last_error,
                 "servo_position": servo.last_sent,
                 "rotation_speed_dps": rotation_speed,
                 "kp_active": pid.kp_active,
