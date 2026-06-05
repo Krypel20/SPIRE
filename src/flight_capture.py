@@ -179,7 +179,7 @@ class Camera:
         self.cam = Picamera2()
         config = self.cam.create_still_configuration(
             main={"size": (4056, 3040)},
-            lores={"size": (800, 600)},
+            lores={"size": (1280, 960)},
         )
         self.cam.configure(config)
         self.streaming_output = StreamingOutput()
@@ -620,6 +620,8 @@ Examples:
     # Timing
     parser.add_argument("--stabilize-time", type=float, default=2.0,
                         help="Min stabilization time before gate (default: 2.0)")
+    parser.add_argument("--settle-time", type=float, default=0.15,
+                    help="Wait after servo freeze before capture (default: 0.15s)")
     parser.add_argument("--center-time", type=float, default=1.5,
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
@@ -673,13 +675,9 @@ Examples:
     log.info("=" * 50)
     log.info("SPIRE Flight Capture v2.1")
     log.info("=" * 50)
-    log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s")
-    log.info(f"Gate: error<{args.gate_error} deg, |servo|>={args.gate_servo_min} deg, "
-             f"|plat_gyro|>={args.gate_plat_gyro} deg/s, "
-             f"count={args.gate_count}, timeout={args.gate_timeout}s"
-             f"{', calm-OK' if args.gate_allow_calm else ''}")
+    log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s | Settle: {args.settle_time}s")
     log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
-             f"KI={args.ki}")
+         f"KI={args.ki}")
     log.info("")
  
     # Start IMU readers
@@ -760,8 +758,8 @@ Examples:
  
             # --- Phase 1: Wait (servo detached) ---
             wait_time = max(0, args.interval - args.stabilize_time
-                           - args.gate_timeout - args.center_time
-                           - args.measure_time - 0.5)
+               - args.settle_time - args.center_time
+               - args.measure_time - 0.5)
             log.info(f"[Cycle {frame_id}] Waiting {wait_time:.1f}s...")
  
             wait_end = time.monotonic() + wait_time
@@ -797,95 +795,71 @@ Examples:
             pid.heading_ref = pid.filtered_heading
             log.info(f"  Heading ref: {pid.heading_ref:.1f} deg")
 
-            # --- Phases 3+4+5: PID loop with inline capture gate ---
-            phase_start = time.monotonic()
-            gate_min_end = phase_start + args.stabilize_time
-            gate_deadline = phase_start + args.stabilize_time + args.gate_timeout
-            gate_stable_count = 0
+            log.info(f"[Cycle {frame_id}] Stabilize + capture...")
+
+            # --- Phases 3+4: PID stabilization then capture ---
+            phase_end = time.monotonic() + args.stabilize_time
             last_error = 0.0
-            captured = False
+            plat = None
+            cam_data = None
 
-            def do_capture(gate_status, plat_snap, cam_snap):
-                capture_mono_ns = time.monotonic_ns()
-                plat_gz = plat_snap.get("gyro_z", 0) if plat_snap else 0
-                cam_gz = cam_snap.get("gyro_z", 0) if cam_snap else 0
-                log.info(
-                    f"[Cycle {frame_id}] Capture [{gate_status}] "
-                    f"error:{last_error:+.1f} deg, "
-                    f"servo:{servo.last_sent:+.1f} deg, "
-                    f"plat_gz:{plat_gz:+.1f} deg/s, "
-                    f"cam_gz:{cam_gz:+.1f} deg/s"
-                )
-                metadata = {
-                    "frame_id": frame_id,
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "capture_mono_ns": capture_mono_ns,
-                    "gate_status": gate_status,
-                    "gate_stable_count": gate_stable_count,
-                    "heading_ref": pid.heading_ref,
-                    "heading_current": pid.filtered_heading,
-                    "heading_error": last_error,
-                    "servo_position": servo.last_sent,
-                    "rotation_speed_dps": rotation_speed,
-                    "kp_active": pid.kp_active,
-                    "platform_gyro_z": plat_gz,
-                    "platform_imu_ts": plat_snap.get("timestamp_mono_ns", 0) if plat_snap else 0,
-                    "camera_gyro_z": cam_gz,
-                    "camera_imu_ts": cam_snap.get("timestamp_mono_ns", 0) if cam_snap else 0,
-                }
-                if camera:
-                    camera.capture(frame_id, metadata)
-                else:
-                    log.info(f"  [no-camera] Would capture frame {frame_id}")
-
-            while running and time.monotonic() < gate_deadline:
+            while running and time.monotonic() < phase_end:
                 plat = shm_platform.read()
                 cam_data = shm_camera.read()
                 result = pid.update(plat)
-
                 if not result:
                     time.sleep(0.01)
                     continue
-
-                servo_angle, error, _is_correcting = result
+                servo_angle, error, _ = result
                 last_error = error
                 servo.set_position(servo_angle)
-
-                gate_ready = time.monotonic() >= gate_min_end
-                plat_gyro_z = plat.get("gyro_z", 0.0) if plat else 0.0
-                if gate_ready and capture_gate_ok(
-                    error, plat_gyro_z, servo.last_sent, args
-                ):
-                    gate_stable_count += 1
-                else:
-                    gate_stable_count = 0
-
-                if gate_ready and gate_stable_count >= args.gate_count:
-                    do_capture("PASS", plat, cam_data)
-                    captured = True
-                    break
-
                 time.sleep(0.01)
 
             if not running:
                 break
 
-            if not captured:
-                plat = shm_platform.read()
-                cam_data = shm_camera.read()
-                result = pid.update(plat)
-                if result:
-                    servo.set_position(result[0])
-                    last_error = result[1]
-                do_capture("TIMEOUT", plat, cam_data)
+            # Servo frozen at compensation angle — wait for physical settle
+            time.sleep(args.settle_time)
+
+            # Capture while servo holds position
+            plat = shm_platform.read()
+            cam_data = shm_camera.read()
+            plat_gz = plat.get("gyro_z", 0) if plat else 0
+            cam_gz = cam_data.get("gyro_z", 0) if cam_data else 0
+            log.info(
+                f"[Cycle {frame_id}] Capture "
+                f"error:{last_error:+.1f} deg, "
+                f"servo:{servo.last_sent:+.1f} deg, "
+                f"plat_gz:{plat_gz:+.1f} deg/s, "
+                f"cam_gz:{cam_gz:+.1f} deg/s"
+            )
+            metadata = {
+                "frame_id": frame_id,
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "capture_mono_ns": time.monotonic_ns(),
+                "heading_ref": pid.heading_ref,
+                "heading_current": pid.filtered_heading,
+                "heading_error": last_error,
+                "servo_position": servo.last_sent,
+                "rotation_speed_dps": rotation_speed,
+                "kp_active": pid.kp_active,
+                "platform_gyro_z": plat_gz,
+                "platform_imu_ts": plat.get("timestamp_mono_ns", 0) if plat else 0,
+                "camera_gyro_z": cam_gz,
+                "camera_imu_ts": cam_data.get("timestamp_mono_ns", 0) if cam_data else 0,
+            }
+            if camera:
+                camera.capture(frame_id, metadata)
+            else:
+                log.info(f"  [no-camera] Would capture frame {frame_id}")
 
             frame_id += 1
- 
+
             if args.num_photos > 0 and frame_id >= args.num_photos:
                 log.info(f"Photo limit reached ({args.num_photos})")
                 break
- 
-            # --- Phase 6: Slow center ---
+
+            # --- Phase 5: Slow center ---
             log.info(f"[Cycle {frame_id}] Centering servo...")
             servo.slow_center(duration=args.center_time)
             servo.detach()
