@@ -174,12 +174,15 @@ class Camera:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         self.cam = None
+        self.session_photos = []
+        self.last_capture_time = 0
 
     def init(self):
         from picamera2 import Picamera2
         self.cam = Picamera2()
         config = self.cam.create_still_configuration(
             main={"size": (4056, 3040)},
+            lores={"size": (800, 600)},
         )
         self.cam.configure(config)
         self.cam.start()
@@ -197,6 +200,8 @@ class Camera:
         filepath = os.path.join(self.output_dir, filename)
 
         self.cam.capture_file(filepath)
+        self.session_photos.append(filename)
+        self.last_capture_time = time.time()
 
         # Save metadata sidecar
         if metadata:
@@ -239,15 +244,42 @@ class PreviewServer:
                     <style>
                       body { margin:0; background:#111; color:#eee; font-family:monospace; }
                       .container { display:flex; height:100vh; }
-                      .stream { flex:2; display:flex; align-items:center; justify-content:center; }
+                      .stream { flex:2; position:relative; display:flex; align-items:center; justify-content:center; }
                       .stream img { max-width:100%; max-height:100%; }
+                      .flash { position:absolute; top:0; left:0; right:0; bottom:0;
+                               background:rgba(0,255,0,0.3); display:none;
+                               align-items:center; justify-content:center;
+                               font-size:48px; font-weight:bold; color:#0f0; }
                       .gallery { flex:1; border-left:2px solid #333; }
                       .gallery iframe { width:100%; height:100%; border:none; }
                     </style>
+                    <script>
+                      var lastCount = 0;
+                      function checkCapture() {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', '/status', true);
+                        xhr.onload = function() {
+                          if (xhr.status === 200) {
+                            var data = JSON.parse(xhr.responseText);
+                            if (data.photos > lastCount && lastCount > 0) {
+                              document.getElementById('flash').style.display='flex';
+                              document.getElementById('gallery').src='/gallery?' + Date.now();
+                              setTimeout(function(){ document.getElementById('flash').style.display='none'; }, 1500);
+                            }
+                            lastCount = data.photos;
+                          }
+                        };
+                        xhr.send();
+                      }
+                      setInterval(checkCapture, 500);
+                    </script>
                     </head><body>
                     <div class="container">
-                      <div class="stream"><img src="/stream"></div>
-                      <div class="gallery"><iframe src="/gallery"></iframe></div>
+                      <div class="stream">
+                        <img src="/stream">
+                        <div class="flash" id="flash">CAPTURED</div>
+                      </div>
+                      <div class="gallery"><iframe id="gallery" src="/gallery"></iframe></div>
                     </div>
                     </body></html>""")
 
@@ -258,8 +290,11 @@ class PreviewServer:
                     self.end_headers()
                     try:
                         while True:
+                            frame = cam.cam.capture_array("lores")
+                            from PIL import Image
+                            img = Image.fromarray(frame)
                             buf = io.BytesIO()
-                            cam.cam.capture_file(buf, format="jpeg")
+                            img.save(buf, format="JPEG", quality=70)
                             frame = buf.getvalue()
                             self.wfile.write(b"--frame\r\n")
                             self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -267,7 +302,7 @@ class PreviewServer:
                             self.wfile.write(b"\r\n")
                             self.wfile.write(frame)
                             self.wfile.write(b"\r\n")
-                            time.sleep(0.2)
+                            time.sleep(0.032)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
 
@@ -303,28 +338,41 @@ class PreviewServer:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")
                     self.end_headers()
-                    photos = sorted(
-                        [f for f in os.listdir(output_dir) if f.endswith(".jpg")],
-                        reverse=True
-                    ) if os.path.exists(output_dir) else []
-                    html = """<html><head>
-                    <meta http-equiv="refresh" content="5">
+                    photos = list(reversed(cam.session_photos)) if cam.session_photos else []
+                    capturing = (time.time() - cam.last_capture_time) < 2.0
+                    flash = "background:#0a3" if capturing else "background:#111"
+                    html = f"""<html><head>
+                    <meta charset="utf-8">
                     <style>
-                      body { margin:10px; background:#111; color:#eee; font-family:monospace; }
-                      h3 { color:#0ff; margin:0 0 10px; }
-                      img { width:100%; margin-bottom:8px; border:1px solid #333; }
-                      .info { font-size:11px; color:#888; margin-bottom:5px; }
+                      body {{ margin:10px; {flash}; color:#eee; font-family:monospace;
+                             transition: background 0.5s; }}
+                      h3 {{ color:#0ff; margin:0 0 10px; }}
+                      img {{ width:100%; margin-bottom:8px; border:1px solid #333; }}
+                      .info {{ font-size:11px; color:#888; margin-bottom:5px; }}
+                      .flash {{ color:#0f0; font-weight:bold; font-size:14px; margin-bottom:10px; }}
                     </style>
-                    </head><body>
-                    <h3>Photos (""" + str(len(photos)) + """)</h3>"""
+                    </head><body>"""
+                    if capturing:
+                        html += '<div class="flash">CAPTURED!</div>'
+                    html += f"<h3>Session Photos ({len(photos)})</h3>"
                     for p in photos[:20]:
                         html += f'<div class="info">{p}</div>'
                         html += f'<a href="/photo/{p}" target="_blank">'
                         html += f'<img src="/photo/{p}"></a>\n'
                     if not photos:
-                        html += "<p>No photos yet</p>"
+                        html += "<p>No photos yet in this session</p>"
                     html += "</body></html>"
                     self.wfile.write(html.encode())
+
+                elif self.path == "/status":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "photos": len(cam.session_photos),
+                        "last_capture": cam.last_capture_time,
+                        "capturing": (time.time() - cam.last_capture_time) < 2.0,
+                    }).encode())
                 else:
                     self.send_error(404)
 
