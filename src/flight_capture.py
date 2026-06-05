@@ -1,29 +1,21 @@
 #!/usr/bin/env python3
 """
-SPIRE Flight Capture v2
+SPIRE Flight Capture v2.1
 Integrated capture + yaw stabilization with adaptive PID.
- 
-Improvements over v1:
-  - Adaptive KP: measured rotation speed before stabilization sets KP
-  - Adaptive KD: gain scheduling based on heading error (from stabilize_demo)
-  - Capture gate: waits for heading error AND camera gyro below thresholds
-  - IMU timestamp sync: records IMU state at moment of capture
-  - Magnetometer fallback: skips capture if mag data unavailable
-  - Camera IMU in gate: verifies camera is actually stable before capture
- 
+
+Capture fires during active servo compensation (not after servo returns to 0).
+
 Cycle:
   1. Servo detached (no payload disturbance)
-  2. Measure platform rotation speed (last 1s of wait phase)
-  3. Set adaptive KP based on rotation speed
-  4. Set heading reference, enable PID stabilization
-  5. Gate: wait for error < threshold AND camera gyro_z < threshold
-  6. Capture photo with IMU timestamp
-  7. Slowly center servo
-  8. Repeat
- 
+  2. Measure platform rotation speed
+  3. Set adaptive KP, heading reference, run PID
+  4. Gate (inside PID loop): capture when error OK AND servo counter-rotating
+  5. Slowly center servo
+  6. Repeat
+
 Usage:
   python3 src/flight_capture.py --interval 10 -n 10 --preview
-  python3 src/flight_capture.py --kp-low 0.3 --kp-high 1.5 --kd-low 0.4 --kd-high 0.8
+  python3 src/flight_capture.py --gate-servo-min 4 --gate-plat-gyro 0.8
 """
  
 import time
@@ -473,14 +465,14 @@ class StabilizationPID:
  
     def update(self, plat_data):
         """Compute servo position from platform IMU data.
- 
+
         Returns:
-            (servo_angle, error, is_stable) or None if no data
-            servo_angle=None means hold position (inside deadband)
+            (servo_angle, error, is_correcting) or None if no data.
+            Deadband suppresses P only; I/D stay active for ongoing rotation.
         """
         if plat_data is None:
             return None
- 
+
         now = time.monotonic()
         if self.last_time is None:
             self.last_time = now
@@ -488,34 +480,27 @@ class StabilizationPID:
         self.last_time = now
         if dt > 0.1:
             dt = 0.01
- 
+
         mag_x = plat_data.get("mag_x", 0)
         mag_y = plat_data.get("mag_y", 0)
         gyro_rate = plat_data.get("gyro_z", 0.0)
- 
-        # Raw magnetometer heading
+        plat_gyro_z = gyro_rate
+
         mag_heading = compute_heading(mag_x, mag_y)
- 
-        # First reading — set reference
+
         if self.heading_ref is None:
             self.heading_ref = mag_heading
             self.filtered_heading = mag_heading
-            return (0.0, 0.0, True)
- 
-        # Complementary filter
+            return (0.0, 0.0, False)
+
         gyro_heading = self.filtered_heading + gyro_rate * dt
         mag_diff = heading_error(mag_heading, gyro_heading)
         self.filtered_heading = gyro_heading + self.comp_alpha * mag_diff
         self.filtered_heading = self.filtered_heading % 360
- 
-        # Heading error
+
         error = heading_error(self.filtered_heading, self.heading_ref)
- 
-        # Deadband — hold position
-        if abs(error) < self.heading_deadband:
-            return (None, error, True)
- 
-        # Adaptive KD based on error magnitude
+        in_deadband = abs(error) < self.heading_deadband
+
         abs_error = abs(error)
         if abs_error <= self.kd_error_low:
             kd_active = self.kd_low
@@ -524,25 +509,27 @@ class StabilizationPID:
         else:
             t = (abs_error - self.kd_error_low) / (self.kd_error_high - self.kd_error_low)
             kd_active = self.kd_low + t * (self.kd_high - self.kd_low)
- 
-        # P (adaptive)
-        p_out = self.kp_active * error
- 
-        # I
+
+        # Deadband: no P chase on tiny error, but keep I/D for counter-rotation
+        p_out = 0.0 if in_deadband else self.kp_active * error
+
         self.integral += error * dt
         self.integral = max(-135.0, min(135.0, self.integral))
         i_out = self.ki * self.integral
- 
-        # D
-        if abs(gyro_rate) < self.gyro_deadband:
-            gyro_rate = 0.0
-        d_out = kd_active * gyro_rate
- 
+
+        d_gyro = gyro_rate
+        if abs(d_gyro) < self.gyro_deadband:
+            d_gyro = 0.0
+        d_out = kd_active * d_gyro
+
         servo_angle = -(p_out + i_out + d_out)
         servo_angle = max(-135.0, min(135.0, servo_angle))
- 
-        is_stable = abs(error) < self.heading_deadband * 2
-        return (servo_angle, error, is_stable)
+
+        is_correcting = (
+            abs(servo_angle) >= self.heading_deadband
+            or abs(plat_gyro_z) >= self.gyro_deadband
+        )
+        return (servo_angle, error, is_correcting)
  
 # ---------------------------------------------------------------------------
 # Rotation speed measurement
@@ -569,7 +556,32 @@ def measure_rotation_speed(shm_platform, duration=1.0):
     if samples:
         return sum(samples) / len(samples)
     return 0.0
- 
+
+
+def capture_gate_ok(error, plat_gyro_z, servo_position, args):
+    """True when capture should proceed during active compensation."""
+    error_ok = abs(error) < args.gate_error
+    plat_gyro = abs(plat_gyro_z)
+    servo_abs = abs(servo_position)
+
+    active = (
+        error_ok
+        and servo_abs >= args.gate_servo_min
+        and plat_gyro >= args.gate_plat_gyro
+    )
+    if active:
+        return True
+
+    if not args.gate_allow_calm:
+        return False
+
+    # Between swing peaks: payload nearly still, heading locked
+    return (
+        error_ok
+        and plat_gyro < args.gate_plat_gyro
+        and servo_abs < args.gate_servo_min
+    )
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -602,15 +614,19 @@ Examples:
     parser.add_argument("--measure-time", type=float, default=1.0,
                         help="Rotation speed measurement window (default: 1.0)")
  
-    # Capture gate
-    parser.add_argument("--gate-timeout", type=float, default=1.0,
-                        help="Max extra wait for stability after stabilize-time (default: 1.0)")
-    parser.add_argument("--gate-error", type=float, default=5.0,
-                        help="Max heading error to allow capture (default: 5.0 deg)")
-    parser.add_argument("--gate-gyro", type=float, default=2.0,
-                        help="Max camera gyro_z to allow capture (default: 2.0 deg/s)")
-    parser.add_argument("--gate-count", type=int, default=10,
-                        help="Required consecutive stable readings (default: 10)")
+    # Capture gate (active compensation)
+    parser.add_argument("--gate-timeout", type=float, default=2.0,
+                        help="Max wait for gate after stabilize-time (default: 2.0)")
+    parser.add_argument("--gate-error", type=float, default=8.0,
+                        help="Max heading error during capture (default: 8.0 deg)")
+    parser.add_argument("--gate-servo-min", type=float, default=4.0,
+                        help="Min |servo| deg for active compensation gate (default: 4.0)")
+    parser.add_argument("--gate-plat-gyro", type=float, default=0.8,
+                        help="Min |platform gyro_z| deg/s during swing (default: 0.8)")
+    parser.add_argument("--gate-count", type=int, default=8,
+                        help="Consecutive gate-OK readings before capture (default: 8)")
+    parser.add_argument("--gate-allow-calm", action="store_true",
+                        help="Also capture between swings when payload is nearly still")
  
     # Adaptive PID
     parser.add_argument("--kp-low", type=float, default=0.3,
@@ -644,11 +660,13 @@ Examples:
     setup_logging(args.verbose)
  
     log.info("=" * 50)
-    log.info("SPIRE Flight Capture v2")
+    log.info("SPIRE Flight Capture v2.1")
     log.info("=" * 50)
     log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s")
-    log.info(f"Gate: error<{args.gate_error} deg, gyro<{args.gate_gyro} deg/s, "
-             f"count={args.gate_count}, timeout={args.gate_timeout}s")
+    log.info(f"Gate: error<{args.gate_error} deg, |servo|>={args.gate_servo_min} deg, "
+             f"|plat_gyro|>={args.gate_plat_gyro} deg/s, "
+             f"count={args.gate_count}, timeout={args.gate_timeout}s"
+             f"{', calm-OK' if args.gate_allow_calm else ''}")
     log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
              f"KI={args.ki}")
     log.info("")
@@ -748,9 +766,7 @@ Examples:
             )
  
             # --- Phase 3: Set adaptive KP and start stabilization ---
-            log.info(f"[Cycle {frame_id}] Stabilizing...")
- 
-            # Check magnetometer availability
+            log.info(f"[Cycle {frame_id}] Stabilize + gate (inline capture)...")
             plat = shm_platform.read()
             if not plat or (plat.get("mag_x", 0) == 0 and plat.get("mag_y", 0) == 0):
                 log.warning(f"[Cycle {frame_id}] No magnetometer data — skipping capture")
@@ -769,96 +785,89 @@ Examples:
                 time.sleep(0.02)
             pid.heading_ref = pid.filtered_heading
             log.info(f"  Heading ref: {pid.heading_ref:.1f} deg")
- 
-            # Run stabilization for minimum time
-            stabilize_end = time.monotonic() + args.stabilize_time
-            last_error = 0
-            while running and time.monotonic() < stabilize_end:
-                plat = shm_platform.read()
-                result = pid.update(plat)
-                if result:
-                    servo_angle, error, is_stable = result
-                    last_error = error
-                    if servo_angle is not None:
-                        servo.set_position(servo_angle)
-                time.sleep(0.01)
-            if not running:
-                break
- 
-            # --- Phase 4: Capture gate ---
-            log.info(f"[Cycle {frame_id}] Gate check...")
-            gate_passed = False
-            stable_count = 0
-            gate_deadline = time.monotonic() + args.gate_timeout
- 
+
+            # --- Phases 3+4+5: PID loop with inline capture gate ---
+            phase_start = time.monotonic()
+            gate_min_end = phase_start + args.stabilize_time
+            gate_deadline = phase_start + args.stabilize_time + args.gate_timeout
+            gate_stable_count = 0
+            last_error = 0.0
+            captured = False
+
+            def do_capture(gate_status, plat_snap, cam_snap):
+                capture_mono_ns = time.monotonic_ns()
+                plat_gz = plat_snap.get("gyro_z", 0) if plat_snap else 0
+                cam_gz = cam_snap.get("gyro_z", 0) if cam_snap else 0
+                log.info(
+                    f"[Cycle {frame_id}] Capture [{gate_status}] "
+                    f"error:{last_error:+.1f} deg, "
+                    f"servo:{servo.last_sent:+.1f} deg, "
+                    f"plat_gz:{plat_gz:+.1f} deg/s, "
+                    f"cam_gz:{cam_gz:+.1f} deg/s"
+                )
+                metadata = {
+                    "frame_id": frame_id,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "capture_mono_ns": capture_mono_ns,
+                    "gate_status": gate_status,
+                    "gate_stable_count": gate_stable_count,
+                    "heading_ref": pid.heading_ref,
+                    "heading_current": pid.filtered_heading,
+                    "heading_error": last_error,
+                    "servo_position": servo.last_sent,
+                    "rotation_speed_dps": rotation_speed,
+                    "kp_active": pid.kp_active,
+                    "platform_gyro_z": plat_gz,
+                    "platform_imu_ts": plat_snap.get("timestamp_mono_ns", 0) if plat_snap else 0,
+                    "camera_gyro_z": cam_gz,
+                    "camera_imu_ts": cam_snap.get("timestamp_mono_ns", 0) if cam_snap else 0,
+                }
+                if camera:
+                    camera.capture(frame_id, metadata)
+                else:
+                    log.info(f"  [no-camera] Would capture frame {frame_id}")
+
             while running and time.monotonic() < gate_deadline:
                 plat = shm_platform.read()
                 cam_data = shm_camera.read()
                 result = pid.update(plat)
- 
-                if result:
-                    servo_angle, error, is_stable = result
-                    last_error = error
-                    if servo_angle is not None:
-                        servo.set_position(servo_angle)
- 
-                    # Gate conditions:
-                    # 1. Heading error below threshold
-                    # 2. Camera gyro_z below threshold (camera actually stable)
-                    cam_gyro_z = abs(cam_data.get("gyro_z", 99)) if cam_data else 99
-                    error_ok = abs(error) < args.gate_error
-                    gyro_ok = cam_gyro_z < args.gate_gyro
- 
-                    if error_ok and gyro_ok:
-                        stable_count += 1
-                    else:
-                        stable_count = 0
- 
-                    if stable_count >= args.gate_count:
-                        gate_passed = True
-                        break
- 
+
+                if not result:
+                    time.sleep(0.01)
+                    continue
+
+                servo_angle, error, _is_correcting = result
+                last_error = error
+                servo.set_position(servo_angle)
+
+                gate_ready = time.monotonic() >= gate_min_end
+                plat_gyro_z = plat.get("gyro_z", 0.0) if plat else 0.0
+                if gate_ready and capture_gate_ok(
+                    error, plat_gyro_z, servo.last_sent, args
+                ):
+                    gate_stable_count += 1
+                else:
+                    gate_stable_count = 0
+
+                if gate_ready and gate_stable_count >= args.gate_count:
+                    do_capture("PASS", plat, cam_data)
+                    captured = True
+                    break
+
                 time.sleep(0.01)
- 
+
             if not running:
                 break
- 
-            # --- Phase 5: Capture ---
-            # Read IMU state at moment of capture
-            plat_at_capture = shm_platform.read()
-            cam_at_capture = shm_camera.read()
-            capture_mono_ns = time.monotonic_ns()
- 
-            gate_status = "PASS" if gate_passed else "TIMEOUT"
-            cam_gz = abs(cam_at_capture.get("gyro_z", 0)) if cam_at_capture else 0
-            log.info(f"[Cycle {frame_id}] Capture [{gate_status}] "
-                     f"error:{last_error:+.1f} deg, "
-                     f"cam_gz:{cam_gz:.1f} deg/s, "
-                     f"kp:{pid.kp_active:.2f}")
- 
-            metadata = {
-                "frame_id": frame_id,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "capture_mono_ns": capture_mono_ns,
-                "gate_status": gate_status,
-                "gate_stable_count": stable_count,
-                "heading_ref": pid.heading_ref,
-                "heading_current": pid.filtered_heading,
-                "heading_error": last_error,
-                "servo_position": servo.last_sent,
-                "rotation_speed_dps": rotation_speed,
-                "kp_active": pid.kp_active,
-                "platform_gyro_z": plat_at_capture.get("gyro_z", 0) if plat_at_capture else 0,
-                "platform_imu_ts": plat_at_capture.get("timestamp_mono_ns", 0) if plat_at_capture else 0,
-                "camera_gyro_z": cam_at_capture.get("gyro_z", 0) if cam_at_capture else 0,
-                "camera_imu_ts": cam_at_capture.get("timestamp_mono_ns", 0) if cam_at_capture else 0,
-            }
- 
-            if camera:
-                camera.capture(frame_id, metadata)
-            else:
-                log.info(f"  [no-camera] Would capture frame {frame_id}")
- 
+
+            if not captured:
+                plat = shm_platform.read()
+                cam_data = shm_camera.read()
+                result = pid.update(plat)
+                if result:
+                    servo.set_position(result[0])
+                    last_error = result[1]
+                do_capture("TIMEOUT", plat, cam_data)
+
             frame_id += 1
  
             if args.num_photos > 0 and frame_id >= args.num_photos:
