@@ -657,6 +657,8 @@ Examples:
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
                         help="Rotation speed measurement window (default: 1.0)")
+    parser.add_argument("--min-rotation", type=float, default=4.0,
+                    help="Min rotation speed deg/s to activate stabilization (default: 4.0)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,
@@ -828,6 +830,38 @@ Examples:
             log.info(f"  Heading ref: {pid.heading_ref:.1f} deg")
 
             log.info(f"[Cycle {frame_id}] Stabilize + capture...")
+
+            # Skip stabilization if rotation too slow — servo would disturb stationary payload
+            if rotation_speed < args.min_rotation:
+                log.info(f"[Cycle {frame_id}] Capture [CALM] rotation={rotation_speed:.1f} deg/s")
+                plat = shm_platform.read()
+                cam_data = shm_camera.read()
+                plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
+                cam_gz = cam_data.get("gyro_z", 0.0) if cam_data else 0.0
+                metadata = {
+                    "frame_id": frame_id,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "capture_mono_ns": time.monotonic_ns(),
+                    "capture_status": "CALM",
+                    "heading_error": 0.0,
+                    "servo_position": 0.0,
+                    "rotation_speed_dps": rotation_speed,
+                    "kp_active": pid.kp_active,
+                    "platform_gyro_z": plat_gz,
+                    "camera_gyro_z": cam_gz,
+                }
+                if camera:
+                    camera.capture(frame_id, metadata)
+                else:
+                    log.info(f"  [no-camera] Would capture frame {frame_id}")
+                frame_id += 1
+                if args.num_photos > 0 and frame_id >= args.num_photos:
+                    log.info(f"Photo limit reached ({args.num_photos})")
+                    break
+                log.info(f"[Cycle {frame_id}] Centering servo...")
+                servo.slow_center(duration=args.center_time)
+                servo.detach()
+                continue
 
             # --- Phase 3: PID thread starts, runs servo independently ---
             pid_thread = PIDThread(pid, servo, shm_platform)
