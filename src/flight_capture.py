@@ -99,7 +99,7 @@ def heading_error(current, reference):
     while err < -180:
         err += 360
     return err
- 
+
 # ---------------------------------------------------------------------------
 # IMU subprocess
 # ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ class Camera:
         self.cam = Picamera2()
         config = self.cam.create_still_configuration(
             main={"size": (4056, 3040)},
-            lores={"size": (800, 600)},
+            lores={"size": (800, 600), "format": "RGB888"},
         )
         self.cam.configure(config)
         self.cam.start()
