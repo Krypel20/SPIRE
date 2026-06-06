@@ -883,9 +883,11 @@ Examples:
 
             while running and time.monotonic() < capture_deadline:
                 cam_data = shm_camera.read()
+                plat = shm_platform.read()
                 cam_gz_abs = abs(cam_data.get("gyro_z", 999.0)) if cam_data else 999.0
+                plat_gz_abs = abs(plat.get("gyro_z", 0.0)) if plat else 0.0
 
-                if cam_gz_abs < args.cam_gyro_threshold:
+                if cam_gz_abs < args.cam_gyro_threshold and plat_gz_abs >= args.min_rotation:
                     cam_stable_count += 1
                 else:
                     cam_stable_count = 0
