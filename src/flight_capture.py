@@ -565,7 +565,7 @@ class PIDThread(threading.Thread):
                 servo_angle, error, _ = result
                 self.last_error = error
                 self.servo.set_position(servo_angle)
-            time.sleep(0.01)
+            time.sleep(0.003)  # ~300Hz
 
     def stop(self):
         self._stop_event.set()
@@ -687,7 +687,6 @@ Examples:
                         help="Integral gain (default: 0.02)")
     parser.add_argument("--heading-deadband", type=float, default=3.0,
                         help="Heading deadband deg (default: 3.0)")
- 
     # Hardware
     parser.add_argument("--servo-pin", type=int, default=12)
     parser.add_argument("--no-camera", action="store_true",
