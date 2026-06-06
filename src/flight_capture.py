@@ -899,12 +899,11 @@ Examples:
                 time.sleep(0.01)
 
             # Freeze servo at compensation angle
-            pid_thread.stop()
-
             if not running:
+                pid_thread.stop()
                 break
 
-            # Snapshot state and capture
+            # Snapshot state for metadata (servo still actively compensating)
             plat = shm_platform.read()
             cam_data = shm_camera.read()
             plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
@@ -934,10 +933,15 @@ Examples:
                 "camera_gyro_z": cam_gz,
                 "camera_imu_ts": cam_data.get("timestamp_mono_ns", 0) if cam_data else 0,
             }
+
+            # Capture WHILE PID thread keeps servo actively counter-rotating
             if camera:
                 camera.capture(frame_id, metadata)
             else:
                 log.info(f"  [no-camera] Would capture frame {frame_id}")
+
+            # Freeze servo only AFTER capture completes
+            pid_thread.stop()
 
             frame_id += 1
 
