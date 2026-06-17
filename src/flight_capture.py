@@ -193,10 +193,21 @@ class Camera:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename = f"spire_{timestamp}_{frame_id:04d}.jpg"
         filepath = os.path.join(self.output_dir, filename)
-        self.cam.capture_file(filepath)
+        # capture_request() returns a frame already in flight together with its
+        # hardware SensorTimestamp, instead of scheduling a future exposure.
+        request = self.cam.capture_request()
+        try:
+            request.save("main", filepath)
+            cam_meta = request.get_metadata()
+        finally:
+            request.release()
         self.session_photos.append(filename)
         self.last_capture_time = time.time()
         if metadata:
+            # SensorTimestamp: hardware exposure time (ns). Clock domain is
+            # CLOCK_BOOTTIME — alignment with IMU monotonic clock is a separate step.
+            metadata["sensor_timestamp_ns"] = cam_meta.get("SensorTimestamp", 0)
+            metadata["exposure_time_us"] = cam_meta.get("ExposureTime", 0)
             meta_path = filepath.replace(".jpg", "_meta.json")
             with open(meta_path, "w") as f:
                 json.dump(metadata, f, indent=2)
@@ -473,6 +484,8 @@ class StabilizationPID:
         self.filtered_heading = initial_heading
         self.integral = 0.0
         self.last_time = time.monotonic()
+        self.d_filtered = 0.0
+        self._last_error_sign = 0.0
  
     def update(self, plat_data):
         """Compute servo position from platform IMU data.
@@ -510,6 +523,10 @@ class StabilizationPID:
         self.filtered_heading = self.filtered_heading % 360
 
         error = heading_error(self.filtered_heading, self.heading_ref)
+        # Anti-windup: reset integral on error sign change (direction reversal)
+        if self._last_error_sign != 0.0 and error * self._last_error_sign < 0:
+            self.integral = 0.0
+        self._last_error_sign = error
         in_deadband = abs(error) < self.heading_deadband
 
         abs_error = abs(error)
@@ -531,7 +548,9 @@ class StabilizationPID:
         d_gyro = gyro_rate
         if abs(d_gyro) < self.gyro_deadband:
             d_gyro = 0.0
-        d_out = kd_active * d_gyro
+        # Low-pass filter on D source to damp direction-reversal overshoot
+        self.d_filtered = (1 - self.d_alpha) * self.d_filtered + self.d_alpha * d_gyro
+        d_out = kd_active * self.d_filtered
 
         servo_angle = -(p_out + i_out + d_out)
         servo_angle = max(-135.0, min(135.0, servo_angle))
@@ -687,6 +706,8 @@ Examples:
                         help="Integral gain (default: 0.02)")
     parser.add_argument("--heading-deadband", type=float, default=3.0,
                         help="Heading deadband deg (default: 3.0)")
+    parser.add_argument("--d-alpha", type=float, default=0.3,
+                    help="D-term low-pass factor 0-1 (lower=smoother, default: 0.3)")
     # Hardware
     parser.add_argument("--servo-pin", type=int, default=12)
     parser.add_argument("--no-camera", action="store_true",
