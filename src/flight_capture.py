@@ -453,6 +453,11 @@ class StabilizationPID:
  
         # Complementary filter
         self.comp_alpha = comp_alpha
+
+        # D-term low-pass filter (damps direction-reversal overshoot)
+        self.d_filtered = 0.0
+        self.d_alpha = 0.3  # lower = smoother, more lag
+        self._last_error_sign = 0.0
  
         # Error thresholds for KD gain scheduling
         self.kd_error_low = 5.0
