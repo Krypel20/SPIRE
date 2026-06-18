@@ -30,6 +30,7 @@ import logging
 import threading
 import io
 import socket
+import collections
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -595,6 +596,34 @@ class PIDThread(threading.Thread):
         self._stop_event.set()
         self.join(timeout=1.0)
 
+class CamGyroLogger(threading.Thread):
+    """High-rate ring buffer of camera gyro_z for exposure-time correlation."""
+    def __init__(self, shm_camera, maxlen=4000):
+        super().__init__(daemon=True)
+        self.shm = shm_camera
+        self.buf = collections.deque(maxlen=maxlen)
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            c = self.shm.read()
+            if c:
+                self.buf.append((c.get("timestamp_mono_ns", 0), c.get("gyro_z", 0.0)))
+            time.sleep(0.002)  # ~500 Hz, matches IMU rate
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=1.0)
+
+    def gyro_at(self, mono_ns):
+        """Nearest-neighbour cam_gz at a given monotonic timestamp."""
+        best, best_dt = None, None
+        for ts, gz in self.buf:
+            dt = abs(ts - mono_ns)
+            if best_dt is None or dt < best_dt:
+                best_dt, best = dt, gz
+        return best, best_dt
+
 # ---------------------------------------------------------------------------
 # Rotation speed measurement
 # ---------------------------------------------------------------------------
@@ -877,6 +906,19 @@ Examples:
                 }
                 if camera:
                     camera.capture(frame_id, metadata)
+                    if args.diag and cam_logger:
+                        cam_logger.stop()
+                        sensor_ts = metadata.get("sensor_timestamp_ns", 0)
+                        if sensor_ts:
+                            exp_mono = sensor_ts - boottime_to_mono_offset_ns
+                            gz_exp, gap = cam_logger.gyro_at(exp_mono)
+                            if gz_exp is not None:
+                                log.info(
+                                    f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
+                                    f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
+                                )
+                            else:
+                                log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
                 else:
                     log.info(f"  [no-camera] Would capture frame {frame_id}")
                 frame_id += 1
@@ -963,6 +1005,19 @@ Examples:
             # Capture WHILE PID thread keeps servo actively counter-rotating
             if camera:
                 camera.capture(frame_id, metadata)
+                if args.diag and cam_logger:
+                    cam_logger.stop()
+                    sensor_ts = metadata.get("sensor_timestamp_ns", 0)
+                    if sensor_ts:
+                        exp_mono = sensor_ts - boottime_to_mono_offset_ns
+                        gz_exp, gap = cam_logger.gyro_at(exp_mono)
+                        if gz_exp is not None:
+                            log.info(
+                                f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
+                                f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
+                            )
+                        else:
+                            log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
             else:
                 log.info(f"  [no-camera] Would capture frame {frame_id}")
 
