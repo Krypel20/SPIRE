@@ -4,7 +4,7 @@
 **Master's Thesis Project** | AGH University of Science and Technology, Kraków  
 **Program:** Space Technologies  
 **Author:** Piotr Krypel  
-**Status:** Active development — flight test planned for 2026
+**Status:** Active development - flight test planned for 2026
 
 ---
 
