@@ -934,6 +934,10 @@ Examples:
             pid_thread = PIDThread(pid, servo, shm_platform)
             pid_thread.start()
 
+            cam_logger = CamGyroLogger(shm_camera) if args.diag else None
+            if cam_logger:
+                cam_logger.start()
+
             # Minimum stabilization window before monitoring
             stab_end = time.monotonic() + args.stabilize_time
             while running and time.monotonic() < stab_end:
