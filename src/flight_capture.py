@@ -674,11 +674,11 @@ def main():
         description="SPIRE Flight Capture v2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-    Examples:
-    %(prog)s --interval 10 -n 10 --preview
-    %(prog)s --kp-low 0.3 --kp-high 1.5 --kd-low 0.4 --kd-high 0.8
-    %(prog)s --interval 15 --gate-timeout 3.0 --gate-error 3.0
-            """
+Examples:
+  %(prog)s --interval 10 -n 10 --preview
+  %(prog)s --kp-low 0.3 --kp-high 1.5 --kd-low 0.4 --kd-high 0.8
+  %(prog)s --interval 15 --gate-timeout 3.0 --gate-error 3.0
+        """
     )
  
     # Capture
@@ -954,13 +954,11 @@ def main():
 
                 time.sleep(0.01)
 
-            # Freeze servo at compensation angle
-            pid_thread.stop()
-
             if not running:
+                pid_thread.stop()
                 break
 
-            # Snapshot state and capture
+            # Snapshot state — servo STILL actively compensating during exposure
             plat = shm_platform.read()
             cam_data = shm_camera.read()
             plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
@@ -1010,6 +1008,10 @@ def main():
                         log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
                 else:
                     log.info(f"[Cycle {frame_id}] DIAG no sensor_timestamp_ns")
+
+            # Freeze servo only AFTER exposure completes (avoids passive-gimbal
+            # judder and platform re-coupling during the capture window)
+            pid_thread.stop()
 
             frame_id += 1
 
