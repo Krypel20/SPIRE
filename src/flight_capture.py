@@ -29,8 +29,8 @@ import argparse
 import logging
 import threading
 import io
-import socket
 import collections
+import socket
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -205,8 +205,7 @@ class Camera:
         self.session_photos.append(filename)
         self.last_capture_time = time.time()
         if metadata:
-            # SensorTimestamp: hardware exposure time (ns). Clock domain is
-            # CLOCK_BOOTTIME — alignment with IMU monotonic clock is a separate step.
+            # SensorTimestamp: hardware exposure time (ns), CLOCK_BOOTTIME domain.
             metadata["sensor_timestamp_ns"] = cam_meta.get("SensorTimestamp", 0)
             metadata["exposure_time_us"] = cam_meta.get("ExposureTime", 0)
             meta_path = filepath.replace(".jpg", "_meta.json")
@@ -454,11 +453,6 @@ class StabilizationPID:
  
         # Complementary filter
         self.comp_alpha = comp_alpha
-
-        # D-term low-pass filter (damps direction-reversal overshoot)
-        self.d_filtered = 0.0
-        self.d_alpha = 0.3  # lower = smoother, more lag
-        self._last_error_sign = 0.0
  
         # Error thresholds for KD gain scheduling
         self.kd_error_low = 5.0
@@ -490,8 +484,6 @@ class StabilizationPID:
         self.filtered_heading = initial_heading
         self.integral = 0.0
         self.last_time = time.monotonic()
-        self.d_filtered = 0.0
-        self._last_error_sign = 0.0
  
     def update(self, plat_data):
         """Compute servo position from platform IMU data.
@@ -529,10 +521,6 @@ class StabilizationPID:
         self.filtered_heading = self.filtered_heading % 360
 
         error = heading_error(self.filtered_heading, self.heading_ref)
-        # Anti-windup: reset integral on error sign change (direction reversal)
-        if self._last_error_sign != 0.0 and error * self._last_error_sign < 0:
-            self.integral = 0.0
-        self._last_error_sign = error
         in_deadband = abs(error) < self.heading_deadband
 
         abs_error = abs(error)
@@ -554,9 +542,7 @@ class StabilizationPID:
         d_gyro = gyro_rate
         if abs(d_gyro) < self.gyro_deadband:
             d_gyro = 0.0
-        # Low-pass filter on D source to damp direction-reversal overshoot
-        self.d_filtered = (1 - self.d_alpha) * self.d_filtered + self.d_alpha * d_gyro
-        d_out = kd_active * self.d_filtered
+        d_out = kd_active * d_gyro
 
         servo_angle = -(p_out + i_out + d_out)
         servo_angle = max(-135.0, min(135.0, servo_angle))
@@ -567,6 +553,38 @@ class StabilizationPID:
         )
         return (servo_angle, error, is_correcting)
  
+# ---------------------------------------------------------------------------
+# Camera gyro logger — high-rate ring buffer for exposure-time correlation
+# ---------------------------------------------------------------------------
+
+class CamGyroLogger(threading.Thread):
+    """High-rate ring buffer of camera gyro_z for exposure-time correlation."""
+    def __init__(self, shm_camera, maxlen=4000):
+        super().__init__(daemon=True)
+        self.shm = shm_camera
+        self.buf = collections.deque(maxlen=maxlen)
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            c = self.shm.read()
+            if c:
+                self.buf.append((c.get("timestamp_mono_ns", 0), c.get("gyro_z", 0.0)))
+            time.sleep(0.002)
+
+    def stop(self):
+        self._stop_event.set()
+        self.join(timeout=1.0)
+
+    def gyro_at(self, mono_ns):
+        """Nearest-neighbour cam_gz at a given monotonic timestamp."""
+        best, best_dt = None, None
+        for ts, gz in self.buf:
+            dt = abs(ts - mono_ns)
+            if best_dt is None or dt < best_dt:
+                best_dt, best = dt, gz
+        return best, best_dt
+
 # ---------------------------------------------------------------------------
 # PID thread — runs servo independently of capture timing
 # ---------------------------------------------------------------------------
@@ -595,34 +613,6 @@ class PIDThread(threading.Thread):
     def stop(self):
         self._stop_event.set()
         self.join(timeout=1.0)
-
-class CamGyroLogger(threading.Thread):
-    """High-rate ring buffer of camera gyro_z for exposure-time correlation."""
-    def __init__(self, shm_camera, maxlen=4000):
-        super().__init__(daemon=True)
-        self.shm = shm_camera
-        self.buf = collections.deque(maxlen=maxlen)
-        self._stop_event = threading.Event()
-
-    def run(self):
-        while not self._stop_event.is_set():
-            c = self.shm.read()
-            if c:
-                self.buf.append((c.get("timestamp_mono_ns", 0), c.get("gyro_z", 0.0)))
-            time.sleep(0.002)  # ~500 Hz, matches IMU rate
-
-    def stop(self):
-        self._stop_event.set()
-        self.join(timeout=1.0)
-
-    def gyro_at(self, mono_ns):
-        """Nearest-neighbour cam_gz at a given monotonic timestamp."""
-        best, best_dt = None, None
-        for ts, gz in self.buf:
-            dt = abs(ts - mono_ns)
-            if best_dt is None or dt < best_dt:
-                best_dt, best = dt, gz
-        return best, best_dt
 
 # ---------------------------------------------------------------------------
 # Rotation speed measurement
@@ -684,11 +674,11 @@ def main():
         description="SPIRE Flight Capture v2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s --interval 10 -n 10 --preview
-  %(prog)s --kp-low 0.3 --kp-high 1.5 --kd-low 0.4 --kd-high 0.8
-  %(prog)s --interval 15 --gate-timeout 3.0 --gate-error 3.0
-        """
+    Examples:
+    %(prog)s --interval 10 -n 10 --preview
+    %(prog)s --kp-low 0.3 --kp-high 1.5 --kd-low 0.4 --kd-high 0.8
+    %(prog)s --interval 15 --gate-timeout 3.0 --gate-error 3.0
+            """
     )
  
     # Capture
@@ -698,8 +688,6 @@ Examples:
                         help="Number of photos, 0=infinite (default: 0)")
     parser.add_argument("-o", "--output", default="data/flight",
                         help="Output directory (default: data/flight)")
-    parser.add_argument("--diag", action="store_true",
-                    help="Enable exposure-time cam_gz correlation diagnostics")
  
     # Timing
     parser.add_argument("--stabilize-time", type=float, default=2.0,
@@ -742,8 +730,6 @@ Examples:
                         help="Integral gain (default: 0.02)")
     parser.add_argument("--heading-deadband", type=float, default=3.0,
                         help="Heading deadband deg (default: 3.0)")
-    parser.add_argument("--d-alpha", type=float, default=0.3,
-                    help="D-term low-pass factor 0-1 (lower=smoother, default: 0.3)")
     # Hardware
     parser.add_argument("--servo-pin", type=int, default=12)
     parser.add_argument("--no-camera", action="store_true",
@@ -755,6 +741,8 @@ Examples:
     # IMU
     parser.add_argument("--cam-cal", default="config/imu_calibration.json")
     parser.add_argument("--plat-cal", default="config/lsm9ds1_calibration.json")
+    parser.add_argument("--diag", action="store_true",
+                        help="Enable exposure-time cam_gz correlation diagnostics")
  
     parser.add_argument("-v", "--verbose", action="store_true")
  
@@ -836,6 +824,13 @@ Examples:
     signal.signal(signal.SIGTERM, handle_signal)
  
     log.info("")
+    boottime_to_mono_offset_ns = (
+        time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        - time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    )
+    if args.diag:
+        log.info(f"Clock offset BOOTTIME-MONOTONIC: "
+                 f"{boottime_to_mono_offset_ns/1e6:.1f} ms")
     log.info("Flight capture started. Ctrl+C to stop.")
     log.info("")
  
@@ -908,19 +903,6 @@ Examples:
                 }
                 if camera:
                     camera.capture(frame_id, metadata)
-                    if args.diag and cam_logger:
-                        cam_logger.stop()
-                        sensor_ts = metadata.get("sensor_timestamp_ns", 0)
-                        if sensor_ts:
-                            exp_mono = sensor_ts - boottime_to_mono_offset_ns
-                            gz_exp, gap = cam_logger.gyro_at(exp_mono)
-                            if gz_exp is not None:
-                                log.info(
-                                    f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
-                                    f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
-                                )
-                            else:
-                                log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
                 else:
                     log.info(f"  [no-camera] Would capture frame {frame_id}")
                 frame_id += 1
@@ -973,11 +955,12 @@ Examples:
                 time.sleep(0.01)
 
             # Freeze servo at compensation angle
+            pid_thread.stop()
+
             if not running:
-                pid_thread.stop()
                 break
 
-            # Snapshot state for metadata (servo still actively compensating)
+            # Snapshot state and capture
             plat = shm_platform.read()
             cam_data = shm_camera.read()
             plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
@@ -1007,28 +990,26 @@ Examples:
                 "camera_gyro_z": cam_gz,
                 "camera_imu_ts": cam_data.get("timestamp_mono_ns", 0) if cam_data else 0,
             }
-
-            # Capture WHILE PID thread keeps servo actively counter-rotating
             if camera:
                 camera.capture(frame_id, metadata)
-                if args.diag and cam_logger:
-                    cam_logger.stop()
-                    sensor_ts = metadata.get("sensor_timestamp_ns", 0)
-                    if sensor_ts:
-                        exp_mono = sensor_ts - boottime_to_mono_offset_ns
-                        gz_exp, gap = cam_logger.gyro_at(exp_mono)
-                        if gz_exp is not None:
-                            log.info(
-                                f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
-                                f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
-                            )
-                        else:
-                            log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
             else:
                 log.info(f"  [no-camera] Would capture frame {frame_id}")
 
-            # Freeze servo only AFTER capture completes
-            pid_thread.stop()
+            if args.diag and cam_logger:
+                cam_logger.stop()
+                sensor_ts = metadata.get("sensor_timestamp_ns", 0)
+                if sensor_ts:
+                    exp_mono = sensor_ts - boottime_to_mono_offset_ns
+                    gz_exp, gap = cam_logger.gyro_at(exp_mono)
+                    if gz_exp is not None:
+                        log.info(
+                            f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
+                            f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
+                        )
+                    else:
+                        log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
+                else:
+                    log.info(f"[Cycle {frame_id}] DIAG no sensor_timestamp_ns")
 
             frame_id += 1
 
