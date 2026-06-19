@@ -382,50 +382,67 @@ class PreviewServer:
 # ---------------------------------------------------------------------------
  
 class ServoController:
-    def __init__(self, pin=12):
-        from gpiozero import Servo
-        from gpiozero.pins.lgpio import LGPIOFactory
-        self.factory = LGPIOFactory()
-        self.servo = Servo(
-            pin, pin_factory=self.factory,
-            min_pulse_width=0.5 / 1000,
-            max_pulse_width=2.5 / 1000,
-        )
-        self.servo.detach()
+    """Hardware-PWM servo control on RPi 5 via rpi-hardware-pwm (jitter-free).
+
+    GPIO 12 = PWM0 channel 0 on Pi 5 (physical pin 32).
+    Requires: dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4 in config.txt.
+    On Linux kernel 6.12+ (Debian Trixie) all models use chip=0.
+    """
+    PERIOD_MS = 20.0          # 50 Hz servo frame
+    MIN_PULSE_MS = 0.5        # maps to -range_deg
+    MAX_PULSE_MS = 2.5        # maps to +range_deg
+
+    def __init__(self, pin=12, channel=0, chip=0):
+        from rpi_hardware_pwm import HardwarePWM
+        self.pwm = HardwarePWM(pwm_channel=channel, hz=50, chip=chip)
+        self.range_deg = 135.0
         self.current_position = 0.0
         self.last_sent = 0.0
-        self.range_deg = 135.0
-        log.info(f"Servo on GPIO {pin} (detached)")
- 
+        self._attached = False
+        log.info(f"Servo on GPIO {pin} via hardware PWM ch{channel} (detached)")
+
+    def _angle_to_duty(self, angle_deg):
+        # Map [-range, +range] -> [MIN_PULSE, MAX_PULSE] ms, then to duty %
+        frac = (angle_deg + self.range_deg) / (2 * self.range_deg)  # 0..1
+        pulse_ms = self.MIN_PULSE_MS + frac * (self.MAX_PULSE_MS - self.MIN_PULSE_MS)
+        return pulse_ms / self.PERIOD_MS * 100.0
+
+    def _drive(self, angle_deg):
+        duty = self._angle_to_duty(angle_deg)
+        if not self._attached:
+            self.pwm.start(duty)
+            self._attached = True
+        else:
+            self.pwm.change_duty_cycle(duty)
+
     def set_position(self, angle_deg, threshold=1.0):
         angle_deg = max(-self.range_deg, min(self.range_deg, angle_deg))
         self.current_position = angle_deg
         if abs(angle_deg - self.last_sent) > threshold:
-            value = angle_deg / self.range_deg
-            value = max(-1.0, min(1.0, value))
-            self.servo.value = value
+            self._drive(angle_deg)
             self.last_sent = angle_deg
- 
+
     def slow_center(self, duration=1.5):
         start = self.last_sent
         steps = 30
         for i in range(steps + 1):
             t = i / steps
             angle = start * (1 - t)
-            value = angle / self.range_deg
-            value = max(-1.0, min(1.0, value))
-            self.servo.value = value
+            self._drive(angle)
             self.last_sent = angle
             time.sleep(duration / steps)
         self.current_position = 0.0
         self.last_sent = 0.0
- 
+
     def detach(self):
-        self.servo.detach()
- 
+        # Stop pulse train -- servo goes limp (no holding torque, no jitter)
+        if self._attached:
+            self.pwm.stop()
+            self._attached = False
+
     def close(self):
-        self.servo.detach()
- 
+        self.detach()
+
 # ---------------------------------------------------------------------------
 # Stabilization PID with adaptive KP and KD
 # ---------------------------------------------------------------------------
