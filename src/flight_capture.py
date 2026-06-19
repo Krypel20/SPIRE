@@ -698,6 +698,8 @@ Examples:
                         help="Number of photos, 0=infinite (default: 0)")
     parser.add_argument("-o", "--output", default="data/flight",
                         help="Output directory (default: data/flight)")
+    parser.add_argument("--diag", action="store_true",
+                    help="Enable exposure-time cam_gz correlation diagnostics")
  
     # Timing
     parser.add_argument("--stabilize-time", type=float, default=2.0,
