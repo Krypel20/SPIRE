@@ -213,6 +213,54 @@ class Camera:
                 json.dump(metadata, f, indent=2)
         log.info(f"Photo {frame_id}: {filename}")
         return filepath
+
+    def capture_burst(self, frame_id, n):
+        """Capture n consecutive full-res frames to temp files.
+
+        Returns list of dicts: {tmp_path, sensor_timestamp_ns, exposure_time_us}.
+        Each frame is saved and its request released immediately to avoid
+        exhausting the camera buffer pool. Selection happens in the caller.
+        """
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        frames = []
+        for i in range(n):
+            tmp_path = os.path.join(
+                self.output_dir, f".burst_{timestamp}_{frame_id:04d}_{i}.jpg"
+            )
+            request = self.cam.capture_request()
+            try:
+                request.save("main", tmp_path)
+                cam_meta = request.get_metadata()
+            finally:
+                request.release()
+            frames.append({
+                "tmp_path": tmp_path,
+                "sensor_timestamp_ns": cam_meta.get("SensorTimestamp", 0),
+                "exposure_time_us": cam_meta.get("ExposureTime", 0),
+            })
+        return frames
+
+    def commit_burst_winner(self, frame_id, winner, losers, metadata=None):
+        """Rename winning temp frame to final name, delete losers, write meta."""
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"spire_{timestamp}_{frame_id:04d}.jpg"
+        filepath = os.path.join(self.output_dir, filename)
+        os.replace(winner["tmp_path"], filepath)
+        for f in losers:
+            try:
+                os.remove(f["tmp_path"])
+            except FileNotFoundError:
+                pass
+        self.session_photos.append(filename)
+        self.last_capture_time = time.time()
+        if metadata:
+            metadata["sensor_timestamp_ns"] = winner["sensor_timestamp_ns"]
+            metadata["exposure_time_us"] = winner["exposure_time_us"]
+            meta_path = filepath.replace(".jpg", "_meta.json")
+            with open(meta_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+        log.info(f"Photo {frame_id}: {filename}")
+        return filepath
  
     def close(self):
         if self.cam:
@@ -713,6 +761,8 @@ Examples:
                         help="Max |cam gyro_z| deg/s to trigger capture (default: 20.0)")
     parser.add_argument("--cam-stable-count", type=int, default=5,
                         help="Consecutive stable samples before capture (default: 5)")
+    parser.add_argument("--burst-count", type=int, default=1,
+                        help="Frames per burst; keep lowest |cam_gz| (1 = no burst, default: 1)")
     parser.add_argument("--center-time", type=float, default=1.5,
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
@@ -770,7 +820,8 @@ Examples:
     log.info("SPIRE Flight Capture v2.1")
     log.info("=" * 50)
     log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s | "
-            f"Cam threshold: {args.cam_gyro_threshold} deg/s x{args.cam_stable_count}")
+            f"Cam threshold: {args.cam_gyro_threshold} deg/s x{args.cam_stable_count}"
+            f" | Burst: {args.burst_count}")
     log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
             f"KI={args.ki}")
     log.info("")
@@ -935,7 +986,9 @@ Examples:
             pid_thread = PIDThread(pid, servo, shm_platform)
             pid_thread.start()
 
-            cam_logger = CamGyroLogger(shm_camera) if args.diag else None
+            # Logger needed for burst frame selection and for diag correlation
+            need_logger = args.diag or args.burst_count > 1
+            cam_logger = CamGyroLogger(shm_camera) if need_logger else None
             if cam_logger:
                 cam_logger.start()
 
@@ -1006,25 +1059,59 @@ Examples:
                 "camera_imu_ts": cam_data.get("timestamp_mono_ns", 0) if cam_data else 0,
             }
             if camera:
-                camera.capture(frame_id, metadata)
+                if args.burst_count > 1 and cam_logger:
+                    # Burst: capture N frames while servo still compensates,
+                    # then keep the one with the lowest |cam_gz| at its exposure.
+                    frames = camera.capture_burst(frame_id, args.burst_count)
+                    cam_logger.stop()
+                    scored = []
+                    for f in frames:
+                        sts = f["sensor_timestamp_ns"]
+                        if sts:
+                            exp_mono = sts - boottime_to_mono_offset_ns
+                            gz, gap = cam_logger.gyro_at(exp_mono)
+                            f["exposure_cam_gz"] = gz if gz is not None else 999.0
+                            f["match_gap_ms"] = gap / 1e6 if gap is not None else -1.0
+                        else:
+                            f["exposure_cam_gz"] = 999.0
+                            f["match_gap_ms"] = -1.0
+                        scored.append(f)
+                    winner = min(scored, key=lambda f: abs(f["exposure_cam_gz"]))
+                    losers = [f for f in scored if f is not winner]
+                    metadata["burst_count"] = args.burst_count
+                    metadata["burst_exposure_cam_gz"] = [
+                        round(f["exposure_cam_gz"], 1) for f in scored
+                    ]
+                    metadata["winner_exposure_cam_gz"] = round(
+                        winner["exposure_cam_gz"], 1
+                    )
+                    camera.commit_burst_winner(frame_id, winner, losers, metadata)
+                    log.info(
+                        f"[Cycle {frame_id}] BURST {args.burst_count} frames, "
+                        f"exposure_cam_gz={metadata['burst_exposure_cam_gz']} "
+                        f"-> kept {winner['exposure_cam_gz']:+.1f} deg/s"
+                    )
+                else:
+                    camera.capture(frame_id, metadata)
+                    if args.diag and cam_logger:
+                        cam_logger.stop()
+                        sensor_ts = metadata.get("sensor_timestamp_ns", 0)
+                        if sensor_ts:
+                            exp_mono = sensor_ts - boottime_to_mono_offset_ns
+                            gz_exp, gap = cam_logger.gyro_at(exp_mono)
+                            if gz_exp is not None:
+                                log.info(
+                                    f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
+                                    f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
+                                )
+                            else:
+                                log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
+                        else:
+                            log.info(f"[Cycle {frame_id}] DIAG no sensor_timestamp_ns")
             else:
                 log.info(f"  [no-camera] Would capture frame {frame_id}")
-
-            if args.diag and cam_logger:
-                cam_logger.stop()
-                sensor_ts = metadata.get("sensor_timestamp_ns", 0)
-                if sensor_ts:
-                    exp_mono = sensor_ts - boottime_to_mono_offset_ns
-                    gz_exp, gap = cam_logger.gyro_at(exp_mono)
-                    if gz_exp is not None:
-                        log.info(
-                            f"[Cycle {frame_id}] DIAG exposure_cam_gz={gz_exp:+.1f} deg/s "
-                            f"(snapshot was {cam_gz:+.1f}, match gap={gap/1e6:.1f} ms)"
-                        )
-                    else:
-                        log.info(f"[Cycle {frame_id}] DIAG no cam_gz sample near exposure")
-                else:
-                    log.info(f"[Cycle {frame_id}] DIAG no sensor_timestamp_ns")
+                if cam_logger:
+                    cam_logger.stop()
 
             # Freeze servo only AFTER exposure completes (avoids passive-gimbal
             # judder and platform re-coupling during the capture window)
