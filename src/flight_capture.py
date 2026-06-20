@@ -763,6 +763,9 @@ Examples:
                         help="Consecutive stable samples before capture (default: 5)")
     parser.add_argument("--burst-count", type=int, default=1,
                         help="Frames per burst; keep lowest |cam_gz| (1 = no burst, default: 1)")
+    parser.add_argument("--burst-early", action="store_true",
+                        help="Start burst right after stabilize-time across the full servo "
+                             "arc, skipping the STABLE gate (requires burst-count > 1)")
     parser.add_argument("--center-time", type=float, default=1.5,
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
@@ -1003,26 +1006,32 @@ Examples:
 
             # --- Phase 4: Monitor cam_gz, capture when camera is stable ---
             cam_stable_count = 0
-            capture_deadline = time.monotonic() + args.gate_timeout
             captured = False
             cam_data = None
 
-            while running and time.monotonic() < capture_deadline:
-                cam_data = shm_camera.read()
-                plat = shm_platform.read()
-                cam_gz_abs = abs(cam_data.get("gyro_z", 999.0)) if cam_data else 999.0
-                plat_gz_abs = abs(plat.get("gyro_z", 0.0)) if plat else 0.0
+            if args.burst_early and args.burst_count > 1:
+                # Early burst: skip the STABLE gate, capture across the whole
+                # servo correction arc right after stabilize_time. Selection by
+                # cam_gz then picks the best frame from the full sweep.
+                captured = True
+            else:
+                capture_deadline = time.monotonic() + args.gate_timeout
+                while running and time.monotonic() < capture_deadline:
+                    cam_data = shm_camera.read()
+                    plat = shm_platform.read()
+                    cam_gz_abs = abs(cam_data.get("gyro_z", 999.0)) if cam_data else 999.0
+                    plat_gz_abs = abs(plat.get("gyro_z", 0.0)) if plat else 0.0
 
-                if cam_gz_abs < args.cam_gyro_threshold and plat_gz_abs >= args.min_rotation:
-                    cam_stable_count += 1
-                else:
-                    cam_stable_count = 0
+                    if cam_gz_abs < args.cam_gyro_threshold and plat_gz_abs >= args.min_rotation:
+                        cam_stable_count += 1
+                    else:
+                        cam_stable_count = 0
 
-                if cam_stable_count >= args.cam_stable_count:
-                    captured = True
-                    break
+                    if cam_stable_count >= args.cam_stable_count:
+                        captured = True
+                        break
 
-                time.sleep(0.01)
+                    time.sleep(0.01)
 
             if not running:
                 pid_thread.stop()
@@ -1033,7 +1042,10 @@ Examples:
             cam_data = shm_camera.read()
             plat_gz = plat.get("gyro_z", 0.0) if plat else 0.0
             cam_gz = cam_data.get("gyro_z", 0.0) if cam_data else 0.0
-            status = "STABLE" if captured else "TIMEOUT"
+            if args.burst_early and args.burst_count > 1:
+                status = "BURST-EARLY"
+            else:
+                status = "STABLE" if captured else "TIMEOUT"
             log.info(
                 f"[Cycle {frame_id}] Capture [{status}] "
                 f"error:{pid_thread.last_error:+.1f} deg, "
