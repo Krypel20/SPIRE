@@ -68,9 +68,9 @@ def main():
     parser = argparse.ArgumentParser(description="SPIRE Live Preview")
     parser.add_argument("-p", "--port", type=int, default=8080,
                         help="Port HTTP (default: 8080)")
-    parser.add_argument("--width", type=int, default=1012,
+    parser.add_argument("--width", type=int, default=2028,
                         help="Preview width (default: 1012)")
-    parser.add_argument("--height", type=int, default=760,
+    parser.add_argument("--height", type=int, default=1520,
                         help="Preview height (default: 760)")
     args = parser.parse_args()
 
