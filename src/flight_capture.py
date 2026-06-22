@@ -499,7 +499,7 @@ class StabilizationPID:
     def __init__(self, kp_low=0.3, kp_high=1.5,
                  kd_low=0.4, kd_high=0.8, ki=0.02,
                  heading_deadband=5.0, gyro_deadband=0.5,
-                 comp_alpha=0.02):
+                 comp_alpha=0.02, d_alpha=0.3):
         # Adaptive KP boundaries
         self.kp_low = kp_low
         self.kp_high = kp_high
@@ -518,6 +518,10 @@ class StabilizationPID:
  
         # Complementary filter
         self.comp_alpha = comp_alpha
+
+        # D-term low-pass filter (damps gyro noise at low rotation)
+        self.d_alpha = d_alpha
+        self.d_filtered = 0.0
  
         # Error thresholds for KD gain scheduling
         self.kd_error_low = 5.0
@@ -548,6 +552,7 @@ class StabilizationPID:
         self.heading_ref = initial_heading
         self.filtered_heading = initial_heading
         self.integral = 0.0
+        self.d_filtered = 0.0
         self.last_time = time.monotonic()
  
     def update(self, plat_data):
@@ -607,7 +612,9 @@ class StabilizationPID:
         d_gyro = gyro_rate
         if abs(d_gyro) < self.gyro_deadband:
             d_gyro = 0.0
-        d_out = kd_active * d_gyro
+        # Low-pass filter D source to suppress gyro noise at low rotation
+        self.d_filtered = (1 - self.d_alpha) * self.d_filtered + self.d_alpha * d_gyro
+        d_out = kd_active * self.d_filtered
 
         servo_angle = -(p_out + i_out + d_out)
         servo_angle = max(-135.0, min(135.0, servo_angle))
@@ -755,23 +762,27 @@ Examples:
                         help="Output directory (default: data/flight)")
  
     # Timing
-    parser.add_argument("--stabilize-time", type=float, default=2.0,
-                        help="Min stabilization time before gate (default: 2.0)")
+    parser.add_argument("--stabilize-time", type=float, default=0.1,
+                        help="Servo settle time before burst starts (default: 0.1)")
     parser.add_argument("--cam-gyro-threshold", type=float, default=20.0,
                         help="Max |cam gyro_z| deg/s to trigger capture (default: 20.0)")
     parser.add_argument("--cam-stable-count", type=int, default=5,
                         help="Consecutive stable samples before capture (default: 5)")
-    parser.add_argument("--burst-count", type=int, default=1,
-                        help="Frames per burst; keep lowest |cam_gz| (1 = no burst, default: 1)")
-    parser.add_argument("--burst-early", action="store_true",
-                        help="Start burst right after stabilize-time across the full servo "
-                             "arc, skipping the STABLE gate (requires burst-count > 1)")
+    parser.add_argument("--burst-count", type=int, default=6,
+                        help="Frames per burst; keep lowest |cam_gz| (1 = no burst, default: 6)")
+    parser.add_argument("--no-burst-early", dest="burst_early", action="store_false",
+                        help="Disable early burst; wait for the STABLE gate before bursting")
+    parser.set_defaults(burst_early=True)
     parser.add_argument("--center-time", type=float, default=1.5,
                         help="Slow centering duration (default: 1.5)")
     parser.add_argument("--measure-time", type=float, default=1.0,
                         help="Rotation speed measurement window (default: 1.0)")
-    parser.add_argument("--min-rotation", type=float, default=4.0,
-                    help="Min rotation speed deg/s to activate stabilization (default: 4.0)")
+    parser.add_argument("--min-rotation", type=float, default=5.0,
+                    help="Min rotation speed deg/s to activate stabilization (default: 5.0)")
+    parser.add_argument("--gyro-deadband", type=float, default=0.5,
+                    help="Zero D-term below this |gyro_rate| deg/s (default: 0.5)")
+    parser.add_argument("--d-alpha", type=float, default=0.3,
+                    help="D-term low-pass factor 0-1; lower = more smoothing (default: 0.3)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,
@@ -826,7 +837,7 @@ Examples:
             f"Cam threshold: {args.cam_gyro_threshold} deg/s x{args.cam_stable_count}"
             f" | Burst: {args.burst_count}")
     log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
-            f"KI={args.ki}")
+            f"KI={args.ki} | gyro_deadband={args.gyro_deadband} d_alpha={args.d_alpha}")
     log.info("")
  
     # Start IMU readers
@@ -881,6 +892,7 @@ Examples:
         kp_low=args.kp_low, kp_high=args.kp_high,
         kd_low=args.kd_low, kd_high=args.kd_high,
         ki=args.ki, heading_deadband=args.heading_deadband,
+        gyro_deadband=args.gyro_deadband, d_alpha=args.d_alpha,
     )
  
     # Flight loop
