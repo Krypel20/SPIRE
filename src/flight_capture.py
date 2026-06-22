@@ -499,7 +499,7 @@ class StabilizationPID:
     def __init__(self, kp_low=0.3, kp_high=1.5,
                  kd_low=0.4, kd_high=0.8, ki=0.02,
                  heading_deadband=5.0, gyro_deadband=0.5,
-                 comp_alpha=0.02, d_alpha=0.3):
+                 comp_alpha=0.02, d_alpha=0.3, rate_gain=1.0):
         # Adaptive KP boundaries
         self.kp_low = kp_low
         self.kp_high = kp_high
@@ -522,6 +522,9 @@ class StabilizationPID:
         # D-term low-pass filter (damps gyro noise at low rotation)
         self.d_alpha = d_alpha
         self.d_filtered = 0.0
+
+        # Rate-integration gain (1.0 = servo counters platform 1:1)
+        self.rate_gain = rate_gain
  
         # Error thresholds for KD gain scheduling
         self.kd_error_low = 5.0
@@ -536,6 +539,10 @@ class StabilizationPID:
         self.filtered_heading = None
         self.integral = 0.0
         self.last_time = None
+
+        # Rate-integration state: servo angle is the running integral of
+        # -platform_rate, so the camera stays inertially fixed in yaw.
+        self.servo_integral = 0.0
  
     def set_kp_from_rotation_speed(self, speed_dps):
         """Set adaptive KP based on measured platform rotation speed."""
@@ -553,14 +560,21 @@ class StabilizationPID:
         self.filtered_heading = initial_heading
         self.integral = 0.0
         self.d_filtered = 0.0
+        self.servo_integral = 0.0
         self.last_time = time.monotonic()
  
     def update(self, plat_data):
-        """Compute servo position from platform IMU data.
+        """Compute servo position by integrating platform angular velocity.
+
+        Rate-integration control law: the servo counter-rotates at the
+        platform's yaw rate so the camera stays inertially fixed. This avoids
+        the position-loop overshoot ("bounce") that the previous heading-error
+        PID exhibited at low rotation. A gyro deadband suppresses sensor noise
+        so a near-still platform leaves the servo still; an optional low-pass
+        smooths the integrated rate.
 
         Returns:
-            (servo_angle, error, is_correcting) or None if no data.
-            Deadband suppresses P only; I/D stay active for ongoing rotation.
+            (servo_angle, servo_deviation, is_correcting) or None if no data.
         """
         if plat_data is None:
             return None
@@ -573,57 +587,26 @@ class StabilizationPID:
         if dt > 0.1:
             dt = 0.01
 
-        mag_x = plat_data.get("mag_x", 0)
-        mag_y = plat_data.get("mag_y", 0)
         gyro_rate = plat_data.get("gyro_z", 0.0)
-        plat_gyro_z = gyro_rate
 
-        mag_heading = compute_heading(mag_x, mag_y)
+        # Deadband: ignore rate below the noise floor so a still platform
+        # produces zero servo motion (no bounce at low rotation).
+        rate = gyro_rate
+        if abs(rate) < self.gyro_deadband:
+            rate = 0.0
 
-        if self.heading_ref is None:
-            self.heading_ref = mag_heading
-            self.filtered_heading = mag_heading
-            return (0.0, 0.0, False)
+        # Low-pass the rate to suppress residual gyro noise.
+        self.d_filtered = (1 - self.d_alpha) * self.d_filtered + self.d_alpha * rate
 
-        gyro_heading = self.filtered_heading + gyro_rate * dt
-        mag_diff = heading_error(mag_heading, gyro_heading)
-        self.filtered_heading = gyro_heading + self.comp_alpha * mag_diff
-        self.filtered_heading = self.filtered_heading % 360
+        # Integrate -rate into the servo angle (camera counter-rotation).
+        self.servo_integral += -self.rate_gain * self.d_filtered * dt
+        self.servo_integral = max(-135.0, min(135.0, self.servo_integral))
+        servo_angle = self.servo_integral
 
-        error = heading_error(self.filtered_heading, self.heading_ref)
-        in_deadband = abs(error) < self.heading_deadband
-
-        abs_error = abs(error)
-        if abs_error <= self.kd_error_low:
-            kd_active = self.kd_low
-        elif abs_error >= self.kd_error_high:
-            kd_active = self.kd_high
-        else:
-            t = (abs_error - self.kd_error_low) / (self.kd_error_high - self.kd_error_low)
-            kd_active = self.kd_low + t * (self.kd_high - self.kd_low)
-
-        # Deadband: no P chase on tiny error, but keep I/D for counter-rotation
-        p_out = 0.0 if in_deadband else self.kp_active * error
-
-        self.integral += error * dt
-        self.integral = max(-135.0, min(135.0, self.integral))
-        i_out = self.ki * self.integral
-
-        d_gyro = gyro_rate
-        if abs(d_gyro) < self.gyro_deadband:
-            d_gyro = 0.0
-        # Low-pass filter D source to suppress gyro noise at low rotation
-        self.d_filtered = (1 - self.d_alpha) * self.d_filtered + self.d_alpha * d_gyro
-        d_out = kd_active * self.d_filtered
-
-        servo_angle = -(p_out + i_out + d_out)
-        servo_angle = max(-135.0, min(135.0, servo_angle))
-
-        is_correcting = (
-            abs(servo_angle) >= self.heading_deadband
-            or abs(plat_gyro_z) >= self.gyro_deadband
-        )
-        return (servo_angle, error, is_correcting)
+        # Report the integrated angle as the "deviation" for logging/metadata
+        # (there is no heading-error term in rate mode).
+        is_correcting = abs(self.d_filtered) >= self.gyro_deadband
+        return (servo_angle, servo_angle, is_correcting)
  
 # ---------------------------------------------------------------------------
 # Camera gyro logger — high-rate ring buffer for exposure-time correlation
@@ -783,6 +766,8 @@ Examples:
                     help="Zero D-term below this |gyro_rate| deg/s (default: 0.5)")
     parser.add_argument("--d-alpha", type=float, default=0.3,
                     help="D-term low-pass factor 0-1; lower = more smoothing (default: 0.3)")
+    parser.add_argument("--rate-gain", type=float, default=1.0,
+                    help="Rate-integration gain; servo counters platform N:1 (default: 1.0)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,
@@ -836,8 +821,8 @@ Examples:
     log.info(f"Interval: {args.interval}s | Stabilize: {args.stabilize_time}s | "
             f"Cam threshold: {args.cam_gyro_threshold} deg/s x{args.cam_stable_count}"
             f" | Burst: {args.burst_count}")
-    log.info(f"PID: KP={args.kp_low}-{args.kp_high} KD={args.kd_low}-{args.kd_high} "
-            f"KI={args.ki} | gyro_deadband={args.gyro_deadband} d_alpha={args.d_alpha}")
+    log.info(f"Control: rate-integration | rate_gain={args.rate_gain} "
+            f"gyro_deadband={args.gyro_deadband} d_alpha={args.d_alpha}")
     log.info("")
  
     # Start IMU readers
@@ -893,6 +878,7 @@ Examples:
         kd_low=args.kd_low, kd_high=args.kd_high,
         ki=args.ki, heading_deadband=args.heading_deadband,
         gyro_deadband=args.gyro_deadband, d_alpha=args.d_alpha,
+        rate_gain=args.rate_gain,
     )
  
     # Flight loop
@@ -950,18 +936,18 @@ Examples:
                 frame_id += 1
                 continue
  
-            # Set adaptive KP
+            # Set adaptive KP (logged for reference; unused in rate mode)
             pid.set_kp_from_rotation_speed(rotation_speed)
- 
-            # Reset PID with fresh heading reference
+
+            # Reset integrator and prime dt with a few platform reads
             pid.reset()
             for _ in range(5):
                 plat = shm_platform.read()
                 if plat:
                     pid.update(plat)
                 time.sleep(0.02)
-            pid.heading_ref = pid.filtered_heading
-            log.info(f"  Heading ref: {pid.heading_ref:.1f} deg")
+            # Re-zero integral so warm-up reads do not bias the servo
+            pid.servo_integral = 0.0
 
             log.info(f"[Cycle {frame_id}] Stabilize + capture...")
 
