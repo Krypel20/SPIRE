@@ -766,8 +766,9 @@ Examples:
                     help="Zero D-term below this |gyro_rate| deg/s (default: 0.5)")
     parser.add_argument("--d-alpha", type=float, default=0.3,
                     help="D-term low-pass factor 0-1; lower = more smoothing (default: 0.3)")
-    parser.add_argument("--rate-gain", type=float, default=1.0,
-                    help="Rate-integration gain; servo counters platform N:1 (default: 1.0)")
+    parser.add_argument("--rate-gain", type=float, default=1.5, # default value should be tested again if servo power is diffrent than 6.2 V
+                    help="Rate-integration gain; servo counters platform N:1 (default: 1.5, "
+                         "calibrated for the servo at ~6.2V)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,
