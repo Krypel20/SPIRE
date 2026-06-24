@@ -38,35 +38,46 @@ PSI_MAX = 25.0
 PSI_TO_HPA = 68.947572932  # 1 psi in hectopascal
 
 
-def read_pressure(bus, addr=MPRLS_ADDR, timeout_s=0.1):
+def read_pressure(bus, addr=MPRLS_ADDR, timeout_s=0.1, retries=3):
     """Trigger one measurement and return (status, raw_counts).
 
-    Raises RuntimeError on integrity/saturation fault or conversion timeout.
+    Raises RuntimeError on integrity/saturation fault or persistent zero data.
+
+    The busy bit can read low immediately after the command, before the sensor
+    has latched it, so we wait the minimum conversion time first and then poll.
+    A raw count of 0 is never a physical reading (0 PSI maps to OUTPUT_MIN, not
+    0), so it signals a timing glitch and we retry.
     """
-    # 1. Start measurement: command 0xAA followed by two 0x00 argument bytes.
-    bus.i2c_rdwr(i2c_msg.write(addr, [0xAA, 0x00, 0x00]))
+    for _ in range(retries):
+        # 1. Start measurement: command 0xAA + two 0x00 argument bytes.
+        bus.i2c_rdwr(i2c_msg.write(addr, [0xAA, 0x00, 0x00]))
 
-    # 2. Poll the status byte until the busy bit clears.
-    deadline = time.monotonic() + timeout_s
-    while True:
-        read = i2c_msg.read(addr, 4)
-        bus.i2c_rdwr(read)
-        data = list(read)
-        status = data[0]
+        # 2. Wait the minimum conversion time, then poll until busy clears.
+        time.sleep(0.005)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            read = i2c_msg.read(addr, 4)
+            bus.i2c_rdwr(read)
+            data = list(read)
+            status = data[0]
 
-        if status & STATUS_INTEGRITY:
-            raise RuntimeError("MPRLS integrity test failed (status 0x%02X)" % status)
-        if status & STATUS_MATH_SAT:
-            raise RuntimeError("MPRLS math saturation (pressure out of range)")
-        if not (status & STATUS_BUSY):
-            break
-        if time.monotonic() > deadline:
-            raise RuntimeError("MPRLS conversion timeout (status 0x%02X)" % status)
-        time.sleep(0.001)
+            if status & STATUS_INTEGRITY:
+                raise RuntimeError("MPRLS integrity test failed (status 0x%02X)" % status)
+            if status & STATUS_MATH_SAT:
+                raise RuntimeError("MPRLS math saturation (pressure out of range)")
+            if not (status & STATUS_BUSY):
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("MPRLS conversion timeout (status 0x%02X)" % status)
+            time.sleep(0.001)
 
-    # 3. Assemble 24-bit pressure count.
-    raw = (data[1] << 16) | (data[2] << 8) | data[3]
-    return status, raw
+        # 3. Assemble 24-bit pressure count.
+        raw = (data[1] << 16) | (data[2] << 8) | data[3]
+        if raw != 0:
+            return status, raw
+        time.sleep(0.005)  # zero data: timing glitch, retry
+
+    raise RuntimeError("MPRLS returned zero data after %d attempts" % retries)
 
 
 def counts_to_hpa(raw):
@@ -80,8 +91,10 @@ def pressure_to_altitude(hpa, sea_level_hpa=1013.25):
 
     Uses the standard sea-level reference by default, so this is pressure
     altitude, not GPS altitude. Set sea_level_hpa to the local QNH to compare
-    against true elevation.
+    against true elevation. Returns NaN for non-physical (<=0) pressure.
     """
+    if hpa <= 0:
+        return float("nan")
     return 44330.0 * (1.0 - (hpa / sea_level_hpa) ** (1.0 / 5.255))
 
 
