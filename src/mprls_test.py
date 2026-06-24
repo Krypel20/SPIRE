@@ -1,143 +1,132 @@
 #!/usr/bin/env python3
 """
-MPRLS (0-172 kPa) pressure sensor test and discovery
-For Adafruit module on RPi I2C bus 1
+MPRLS (Honeywell MPR, Adafruit 3965, 0-25 PSI / 0-172 kPa) test and accuracy check.
+
+The MPR series does NOT use register addressing. Communication is:
+  1. Write the 3-byte measurement command [0xAA, 0x00, 0x00] in one transaction.
+  2. Wait for the conversion to finish (poll the busy bit in the status byte).
+  3. Read 4 bytes: status + 24-bit raw pressure count.
+
+This is why a plain smbus2 write_byte() fails with Remote I/O error: it sends
+a single byte and the sensor NACKs it. We use i2c_rdwr / i2c_msg for proper
+multi-byte transactions instead.
+
+Wiring (RPi 5, I2C bus 1):
+  VIN -> 3.3V (pin 1)      GND -> GND (pin 6)
+  SDA -> GPIO 2 (pin 3)    SCL -> GPIO 3 (pin 5)
+  EOC, RST -> not connected (not needed)
 """
 
-import smbus2
 import time
-import sys
 import statistics
+from smbus2 import SMBus, i2c_msg
 
-def discover_mprls(bus_num=1):
-    """Scan I2C bus for MPRLS sensor (usually 0x76, but may vary)"""
-    bus = smbus2.SMBus(bus_num)
-    
-    print("Scanning I2C bus 1 for MPRLS sensor...")
-    candidates = [0x76, 0x18, 0x1e, 0x77]  # Common MPRLS addresses
-    
-    found = None
-    for addr in candidates:
-        try:
-            # Try to read status byte at offset 0
-            data = bus.read_i2c_block_data(addr, 0, 1)
-            print(f"  ✓ Response at 0x{addr:02x}: status=0x{data[0]:02x}")
-            found = addr
-            break
-        except Exception:
-            pass
-    
-    bus.close()
-    return found
+I2C_BUS = 1
+MPRLS_ADDR = 0x18
 
-def read_mprls_raw(addr=0x76, bus_num=1):
+# Status byte bits (Honeywell MPR datasheet)
+STATUS_POWER = 0x40      # device powered
+STATUS_BUSY = 0x20       # measurement in progress
+STATUS_INTEGRITY = 0x04  # memory integrity test failed
+STATUS_MATH_SAT = 0x01   # math saturation (pressure out of range)
+
+# Transfer-function constants for the 0-25 PSI variant, 10%-90% calibration.
+OUTPUT_MIN = 0x19999A    # 10% of 2^24  = 1677722 counts
+OUTPUT_MAX = 0xE66666    # 90% of 2^24  = 15099494 counts
+PSI_MIN = 0.0
+PSI_MAX = 25.0
+PSI_TO_HPA = 68.947572932  # 1 psi in hectopascal
+
+
+def read_pressure(bus, addr=MPRLS_ADDR, timeout_s=0.1):
+    """Trigger one measurement and return (status, raw_counts).
+
+    Raises RuntimeError on integrity/saturation fault or conversion timeout.
     """
-    Read raw pressure data from MPRLS.
-    
-    Protocol:
-    - Send command 0xAA to trigger measurement
-    - Wait 5ms for conversion
-    - Read 3 bytes: [status, pressure_MSB, pressure_LSB]
-    - Pressure (Pa) = (pressure_data >> 5) * (172000 / 16384)
-    """
-    bus = smbus2.SMBus(bus_num)
-    
-    try:
-        # Trigger measurement
-        bus.write_byte(addr, 0xAA)
-        time.sleep(0.005)  # 5ms conversion time
-        
-        # Read status + 2 pressure bytes
-        data = bus.read_i2c_block_data(addr, 0x00, 3)
+    # 1. Start measurement: command 0xAA followed by two 0x00 argument bytes.
+    bus.i2c_rdwr(i2c_msg.write(addr, [0xAA, 0x00, 0x00]))
+
+    # 2. Poll the status byte until the busy bit clears.
+    deadline = time.monotonic() + timeout_s
+    while True:
+        read = i2c_msg.read(addr, 4)
+        bus.i2c_rdwr(read)
+        data = list(read)
         status = data[0]
-        pressure_raw = (data[1] << 8) | data[2]
-        
-        # Convert raw to pressure in Pa
-        # Formula from Adafruit: pressure = (raw_value >> 5) * (172000 / 16384)
-        pressure_pa = (pressure_raw >> 5) * (172000 / 16384)
-        pressure_hpa = pressure_pa / 100
-        
-        return {
-            'status': status,
-            'pressure_raw': pressure_raw,
-            'pressure_pa': pressure_pa,
-            'pressure_hpa': pressure_hpa,
-            'ready': (status & 0x40) == 0,  # Bit 6: 0=ready, 1=busy
-        }
-    finally:
-        bus.close()
 
-def test_accuracy(addr=0x76, samples=20, interval=0.1):
-    """Run series of measurements to assess accuracy and stability"""
-    print(f"\nRunning {samples} measurements (interval {interval}s)...")
-    print("=" * 60)
-    
-    measurements = []
-    for i in range(samples):
-        try:
-            result = read_mprls_raw(addr=addr)
-            measurements.append(result['pressure_hpa'])
-            
-            status_str = "ready" if result['ready'] else "busy"
-            print(f"  {i+1:2d}. {result['pressure_hpa']:7.2f} hPa  "
-                  f"[status={status_str}, raw=0x{result['pressure_raw']:04x}]")
-            
-            time.sleep(interval)
-        except Exception as e:
-            print(f"  {i+1:2d}. ERROR: {e}")
-            return None
-    
-    # Statistics
-    mean = statistics.mean(measurements)
-    stdev = statistics.stdev(measurements) if len(measurements) > 1 else 0
-    min_p = min(measurements)
-    max_p = max(measurements)
-    
-    print("=" * 60)
-    print(f"Mean:   {mean:.2f} hPa")
-    print(f"StDev:  {stdev:.4f} hPa")
-    print(f"Range:  {min_p:.2f} – {max_p:.2f} hPa (Δ={max_p-min_p:.2f})")
-    print(f"Relative stability: {100*stdev/mean:.3f}% (should be <1% for stable sensor)")
-    
-    return measurements
+        if status & STATUS_INTEGRITY:
+            raise RuntimeError("MPRLS integrity test failed (status 0x%02X)" % status)
+        if status & STATUS_MATH_SAT:
+            raise RuntimeError("MPRLS math saturation (pressure out of range)")
+        if not (status & STATUS_BUSY):
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError("MPRLS conversion timeout (status 0x%02X)" % status)
+        time.sleep(0.001)
 
-def estimate_altitude_from_pressure(pressure_hpa, sea_level_pressure=1013.25):
+    # 3. Assemble 24-bit pressure count.
+    raw = (data[1] << 16) | (data[2] << 8) | data[3]
+    return status, raw
+
+
+def counts_to_hpa(raw):
+    """Convert raw 24-bit count to absolute pressure in hPa."""
+    psi = (raw - OUTPUT_MIN) * (PSI_MAX - PSI_MIN) / (OUTPUT_MAX - OUTPUT_MIN) + PSI_MIN
+    return psi * PSI_TO_HPA
+
+
+def pressure_to_altitude(hpa, sea_level_hpa=1013.25):
+    """Pressure altitude via the international barometric formula (metres).
+
+    Uses the standard sea-level reference by default, so this is pressure
+    altitude, not GPS altitude. Set sea_level_hpa to the local QNH to compare
+    against true elevation.
     """
-    Rough altitude estimate from barometric formula.
-    pressure_hpa: measured pressure in hPa
-    sea_level_pressure: reference (default 1013.25 hPa)
-    Returns: estimated altitude in meters
-    """
-    # Barometric formula: h ≈ 44330 * (1 - (P/P0)^(1/5.255))
-    altitude = 44330 * (1 - (pressure_hpa / sea_level_pressure) ** (1/5.255))
-    return altitude
+    return 44330.0 * (1.0 - (hpa / sea_level_hpa) ** (1.0 / 5.255))
 
-if __name__ == '__main__':
+
+def main():
     print("MPRLS Pressure Sensor Test")
     print("=" * 60)
-    
-    # Step 1: Discover sensor
-    addr = discover_mprls()
-    if not addr:
-        print("ERROR: MPRLS not found on any common address.")
-        print("Check wiring (VIN, GND, SCL, SDA) and I2C bus number.")
-        sys.exit(1)
-    
-    print(f"✓ MPRLS found at 0x{addr:02x}\n")
-    
-    # Step 2: Single test read
-    print("Single measurement:")
-    result = read_mprls_raw(addr=addr)
-    print(f"  Pressure: {result['pressure_hpa']:.2f} hPa")
-    print(f"  Status: ready={result['ready']}, raw=0x{result['pressure_raw']:04x}\n")
-    
-    # Step 3: Accuracy test
-    measurements = test_accuracy(addr=addr, samples=20, interval=0.2)
-    
-    if measurements:
-        # Step 4: Altitude estimation
-        mean_pressure = sum(measurements) / len(measurements)
-        print(f"\nAltitude estimate (from pressure, sea level ref):")
-        print(f"  {estimate_altitude_from_pressure(mean_pressure):.1f} m")
-        print(f"  (This assumes 1013.25 hPa at sea level on test day)")
-        print(f"  Actual altitude depends on local sea-level pressure!")
+
+    with SMBus(I2C_BUS) as bus:
+        # Single measurement.
+        status, raw = read_pressure(bus)
+        hpa = counts_to_hpa(raw)
+        print("Single measurement:")
+        print("  status      : 0x%02X (power=%d busy=%d)"
+              % (status, bool(status & STATUS_POWER), bool(status & STATUS_BUSY)))
+        print("  raw counts  : %d" % raw)
+        print("  pressure    : %.2f hPa  (%.3f kPa, %.3f psi)"
+              % (hpa, hpa / 10.0, hpa / PSI_TO_HPA))
+        print("  pressure alt: %.1f m (vs 1013.25 hPa reference)"
+              % pressure_to_altitude(hpa))
+        print()
+
+        # Repeatability / noise: take N samples and report statistics.
+        n = 50
+        print("Precision check: %d samples..." % n)
+        samples = []
+        for _ in range(n):
+            _, raw_i = read_pressure(bus)
+            samples.append(counts_to_hpa(raw_i))
+            time.sleep(0.02)
+
+        mean = statistics.mean(samples)
+        sd = statistics.pstdev(samples)
+        print("  mean        : %.2f hPa" % mean)
+        print("  std dev     : %.3f hPa  (repeatability / noise floor)" % sd)
+        print("  min / max   : %.2f / %.2f hPa (spread %.2f)"
+              % (min(samples), max(samples), max(samples) - min(samples)))
+        print("  alt noise   : ~%.1f m at this pressure"
+              % abs(pressure_to_altitude(mean) - pressure_to_altitude(mean + sd)))
+        print()
+        print("Note: this is the absolute (station) pressure, not sea-level.")
+        print("To judge accuracy, compare 'mean' against your local station")
+        print("pressure (a nearby weather station / METAR, corrected for your")
+        print("elevation). Datasheet accuracy is +/-1.5%% FSS (~26 hPa worst case);")
+        print("the std dev above is the short-term precision, which is far tighter.")
+
+
+if __name__ == "__main__":
+    main()
