@@ -1,0 +1,36 @@
+# SPIRE autonomous flight service
+# Install:
+#   sudo cp spire-flight.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable spire-flight    # start on every boot
+# Pre-flight check over SSH:
+#   systemctl status spire-flight
+#   journalctl -u spire-flight -f
+# Disable after recovery:
+#   sudo systemctl disable --now spire-flight
+
+[Unit]
+Description=SPIRE flight capture (autonomous)
+# No network dependency: the payload flies without any network.
+After=local-fs.target
+
+[Service]
+Type=simple
+User=revan
+WorkingDirectory=/home/revan/SPIRE
+ExecStartPre=/bin/sleep 20
+ExecStart=/home/revan/payload/.venv/bin/python3 src/flight_capture.py \
+    --gyro-deadband 1.5 \
+    -o data/flight
+Restart=always
+RestartSec=5
+# Give the camera stack time to release on restart
+TimeoutStopSec=15
+
+# Log stdout/stderr to the journal (persist: set Storage=persistent
+# in /etc/systemd/journald.conf so logs survive reboot)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
