@@ -1,45 +1,64 @@
 import RPi.GPIO as GPIO
 import time
 
-# GPIO w numeracji BCM
-LED_GREEN_1 = 5    # pin fizyczny 29
-LED_GREEN_2 = 6    # pin fizyczny 31
-LED_GREEN_3 = 16   # pin fizyczny 36
+# GPIO - numeracja BCM
+RED = 17
+GREEN = 27
+BLUE = 22
 
 GPIO.setmode(GPIO.BCM)
 
-GPIO.setup(LED_GREEN_1, GPIO.OUT, initial=GPIO.LOW)
-GPIO.setup(LED_GREEN_2, GPIO.OUT, initial=GPIO.LOW)
-GPIO.setup(LED_GREEN_3, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(RED, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(GREEN, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(BLUE, GPIO.OUT, initial=GPIO.LOW)
 
 
-def blink(pin, times=5, interval=0.2):
-    for _ in range(times):
-        GPIO.output(pin, GPIO.HIGH)
-        time.sleep(interval)
-        GPIO.output(pin, GPIO.LOW)
-        time.sleep(interval)
+def set_rgb(r, g, b):
+    GPIO.output(RED, r)
+    GPIO.output(GREEN, g)
+    GPIO.output(BLUE, b)
 
 
 try:
-    # GPIO16 - światło stałe
-    GPIO.output(LED_GREEN_3, GPIO.HIGH)
+    print("Test RGB HW-479")
 
-    # Miganie dwóch pozostałych
-    while True:
-        GPIO.output(LED_GREEN_1, GPIO.HIGH)
-        GPIO.output(LED_GREEN_2, GPIO.LOW)
-        time.sleep(0.3)
+    # 1. Zgaszona
+    print("OFF")
+    set_rgb(0, 0, 0)
+    time.sleep(1)
 
-        GPIO.output(LED_GREEN_1, GPIO.LOW)
-        GPIO.output(LED_GREEN_2, GPIO.HIGH)
-        time.sleep(0.3)
+    # 2. Czerwony
+    print("RED - błąd krytyczny")
+    set_rgb(1, 0, 0)
+    time.sleep(2)
+
+    # 3. Żółty / bursztynowy
+    print("YELLOW - rozruch / oczekiwanie")
+    set_rgb(1, 1, 0)
+    time.sleep(2)
+
+    # 4. Niebieski
+    print("BLUE - stabilizacja aktywna")
+    set_rgb(0, 0, 1)
+    time.sleep(2)
+
+    # 5. Zielony
+    print("GREEN - stabilizacja w spoczynku")
+    set_rgb(0, 1, 0)
+    time.sleep(2)
+
+    # 6. Biały
+    print("WHITE - autotest")
+    set_rgb(1, 1, 1)
+    time.sleep(2)
+
+    # Koniec testu
+    print("OFF")
+    set_rgb(0, 0, 0)
 
 except KeyboardInterrupt:
-    pass
+    print("\nPrzerwano.")
 
 finally:
-    GPIO.output(LED_GREEN_1, GPIO.LOW)
-    GPIO.output(LED_GREEN_2, GPIO.LOW)
-    GPIO.output(LED_GREEN_3, GPIO.LOW)
+    set_rgb(0, 0, 0)
     GPIO.cleanup()
