@@ -338,8 +338,13 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
         gap_ms = -1.0
         if sts:
             cam_gz, gap = cam_log.gyro_at(f["exp_mono_ns"])
-            plat_gz, _ = plat_log.gyro_at(f["exp_mono_ns"])
+            plat_gz, plat_gap = plat_log.gyro_at(f["exp_mono_ns"])
             gap_ms = gap / 1e6 if gap is not None else -1.0
+            # Same rule as flight: no real sample near the exposure, no score.
+            if gap is None or gap_ms > fc.MAX_MATCH_GAP_MS:
+                cam_gz = None
+            if plat_gap is None or plat_gap / 1e6 > fc.MAX_MATCH_GAP_MS:
+                plat_gz = None
         f["cam_gz"] = cam_gz
         f["plat_gz"] = plat_gz
         f["match_gap_ms"] = gap_ms
@@ -373,6 +378,10 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
         cycle_valid = status == "ACTIVE"
         reason = "" if cycle_valid else (
             f"rotation {rotation:.1f} < {p['min_rotation']} deg/s, servo not engaged")
+    if cycle_valid and len(valid) < len(frames):
+        cycle_valid = False
+        reason = (f"{len(frames) - len(valid)} frame(s) without a camera gyro "
+                  f"sample within {fc.MAX_MATCH_GAP_MS:.0f} ms (IMU reader stalled?)")
 
     # Keep all frames under final names
     for f in frames:

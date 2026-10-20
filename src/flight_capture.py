@@ -623,6 +623,16 @@ class StabilizationPID:
 # Camera gyro logger — high-rate ring buffer for exposure-time correlation
 # ---------------------------------------------------------------------------
 
+# A burst frame is scored only if a real gyro sample lies this close to its
+# exposure. Normal gaps are ~1 ms (ICM-20948 at ~420 Hz); a dead reader leaves
+# no new samples, so the gap grows and the frame is not trusted.
+MAX_MATCH_GAP_MS = 20.0
+
+# PIDThread ignores platform samples older than this (LSM9DS1 runs at 200 Hz,
+# so a healthy sample is at most ~5-15 ms old).
+PID_STALE_NS = 50_000_000
+
+
 class CamGyroLogger(threading.Thread):
     """High-rate ring buffer of camera gyro_z for exposure-time correlation."""
     def __init__(self, shm_camera, maxlen=4000):
@@ -632,10 +642,16 @@ class CamGyroLogger(threading.Thread):
         self._stop_event = threading.Event()
 
     def run(self):
+        last_ts = None
         while not self._stop_event.is_set():
             c = self.shm.read()
             if c:
-                self.buf.append((c.get("timestamp_mono_ns", 0), c.get("gyro_z", 0.0)))
+                ts = c.get("timestamp_mono_ns", 0)
+                # Shared memory keeps the last sample after a reader stops;
+                # store each sample once so a frozen value is never repeated.
+                if ts != last_ts:
+                    self.buf.append((ts, c.get("gyro_z", 0.0)))
+                    last_ts = ts
             time.sleep(0.002)
 
     def stop(self):
@@ -667,8 +683,23 @@ class PIDThread(threading.Thread):
         self.last_error = 0.0
 
     def run(self):
+        stale = False
         while not self._stop_event.is_set():
             plat = self.shm_platform.read()
+            age_ns = (time.monotonic_ns() - plat.get("timestamp_mono_ns", 0)
+                      if plat else None)
+            if plat is None or age_ns > PID_STALE_NS:
+                # No fresh platform data: hold the servo where it is instead
+                # of integrating a frozen gyro value.
+                if not stale:
+                    age = "n/a" if age_ns is None else f"{age_ns / 1e6:.0f} ms"
+                    log.warning(f"PID: platform data stale ({age}); holding servo")
+                    stale = True
+                time.sleep(0.003)
+                continue
+            if stale:
+                log.info("PID: platform data fresh again; resuming")
+                stale = False
             result = self.pid.update(plat)
             if result:
                 servo_angle, error, _ = result
@@ -679,6 +710,36 @@ class PIDThread(threading.Thread):
     def stop(self):
         self._stop_event.set()
         self.join(timeout=1.0)
+
+# ---------------------------------------------------------------------------
+# Burst winner selection
+# ---------------------------------------------------------------------------
+
+def pick_burst_winner(frames, cam_logger, boottime_to_mono_offset_ns,
+                      max_gap_ms=MAX_MATCH_GAP_MS):
+    """Score each burst frame by camera gyro_z at its exposure; keep the lowest.
+
+    A frame without a sensor timestamp, or without a real gyro sample within
+    max_gap_ms of its exposure, gets exposure_cam_gz = 999 so it can only win
+    if no frame could be scored.
+
+    Returns:
+        (winner, frames) with exposure_cam_gz and match_gap_ms set on each frame.
+    """
+    for f in frames:
+        f["exposure_cam_gz"] = 999.0
+        f["match_gap_ms"] = -1.0
+        sts = f.get("sensor_timestamp_ns")
+        if not sts:
+            continue
+        gz, gap = cam_logger.gyro_at(sts - boottime_to_mono_offset_ns)
+        if gz is None:
+            continue
+        f["match_gap_ms"] = gap / 1e6
+        if f["match_gap_ms"] <= max_gap_ms:
+            f["exposure_cam_gz"] = gz
+    winner = min(frames, key=lambda f: abs(f["exposure_cam_gz"]))
+    return winner, frames
 
 # ---------------------------------------------------------------------------
 # Rotation speed measurement
@@ -1086,19 +1147,8 @@ Examples:
                     # then keep the one with the lowest |cam_gz| at its exposure.
                     frames = camera.capture_burst(frame_id, args.burst_count)
                     cam_logger.stop()
-                    scored = []
-                    for f in frames:
-                        sts = f["sensor_timestamp_ns"]
-                        if sts:
-                            exp_mono = sts - boottime_to_mono_offset_ns
-                            gz, gap = cam_logger.gyro_at(exp_mono)
-                            f["exposure_cam_gz"] = gz if gz is not None else 999.0
-                            f["match_gap_ms"] = gap / 1e6 if gap is not None else -1.0
-                        else:
-                            f["exposure_cam_gz"] = 999.0
-                            f["match_gap_ms"] = -1.0
-                        scored.append(f)
-                    winner = min(scored, key=lambda f: abs(f["exposure_cam_gz"]))
+                    winner, scored = pick_burst_winner(
+                        frames, cam_logger, boottime_to_mono_offset_ns)
                     losers = [f for f in scored if f is not winner]
                     metadata["burst_count"] = args.burst_count
                     metadata["burst_exposure_cam_gz"] = [

@@ -178,8 +178,14 @@ def load_calibration(path):
 # ---------------------------------------------------------------------------
 
 def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
-                  duration_s, cal=None):
+                  duration_s, cal=None, max_fail_s=2.0):
     """High-frequency IMU sampling loop.
+
+    A failed I2C transaction (OSError, e.g. errno 121 after "SDA stuck at
+    low" or errno 11 after "lost arbitration") skips that sample instead of
+    ending the process. Nothing is published for a skipped sample, so
+    consumers see the timestamp age and can reject stale data. Only when
+    reads keep failing for max_fail_s seconds does the loop give up.
 
     Args:
         imu: IMUDriver instance (any supported sensor)
@@ -189,11 +195,19 @@ def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
         enable_mag: Read magnetometer data
         duration_s: Run duration in seconds (0 = infinite)
         cal: Calibration dict or None
+        max_fail_s: Continuous read failure after which the loop gives up
+
+    Returns:
+        True on a normal stop, False if the sensor stopped responding.
     """
     interval = 1.0 / target_rate_hz
     sample_id = 0
     running = True
     mag_data = (0.0, 0.0, 0.0)
+    i2c_errors = 0             # total failed accel/gyro reads
+    window_errors = 0          # failed reads since the last rate report
+    fail_since = None          # monotonic time of the first error in a run
+    status = True
 
     # Pre-extract calibration values for speed
     if cal:
@@ -232,7 +246,27 @@ def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
             t_loop_start = time.monotonic_ns()
 
             # Read accel + gyro (hardware-independent call)
-            ax, ay, az, gx, gy, gz = imu.read_accel_gyro()
+            try:
+                ax, ay, az, gx, gy, gz = imu.read_accel_gyro()
+            except OSError as e:
+                i2c_errors += 1
+                window_errors += 1
+                now = time.monotonic()
+                if fail_since is None:
+                    fail_since = now
+                    log.warning(f"I2C read failed ({e}); sample skipped "
+                                f"[total {i2c_errors}]")
+                if now - fail_since >= max_fail_s:
+                    log.error(f"I2C reads failing for {now - fail_since:.1f} s "
+                              f"({e}); giving up")
+                    status = False
+                    break
+                time.sleep(0.002)  # let the kernel finish bus recovery
+                continue
+            if fail_since is not None:
+                log.info(f"I2C reads recovered after "
+                         f"{(time.monotonic() - fail_since) * 1000:.0f} ms")
+                fail_since = None
 
             # Apply calibration correction
             gx -= gbx; gy -= gby; gz -= gbz
@@ -261,6 +295,7 @@ def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
                 "mag_z": round(mz, 2),
                 "timestamp_mono_ns": t_mono,
                 "sample_id": sample_id,
+                "i2c_errors": i2c_errors,
             }
             publisher.publish(state)
 
@@ -286,8 +321,10 @@ def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
                     f"Rate: {actual_rate:.1f} Hz | "
                     f"Samples: {sample_id} | "
                     f"Gyro: ({gx:.1f}, {gy:.1f}, {gz:.1f}) °/s | "
-                    f"Accel: ({ax:.2f}, {ay:.2f}, {az:.2f}) g"
+                    f"Accel: ({ax:.2f}, {ay:.2f}, {az:.2f}) g | "
+                    f"I2C errors: {window_errors} (total {i2c_errors})"
                 )
+                window_errors = 0
                 perf_start = now
                 perf_samples = 0
 
@@ -304,13 +341,15 @@ def sampling_loop(imu, publisher, logger, target_rate_hz, enable_mag,
 
     except Exception as e:
         log.error(f"Sampling error: {e}", exc_info=True)
+        status = False
 
     finally:
         total_time = time.monotonic() - start_time
         avg_rate = sample_id / total_time if total_time > 0 else 0
         log.info(f"Stopped. Total samples: {sample_id}, "
                  f"avg rate: {avg_rate:.1f} Hz, "
-                 f"duration: {total_time:.1f} s")
+                 f"duration: {total_time:.1f} s, I2C errors: {i2c_errors}")
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +402,9 @@ Examples:
                         help="Disable calibration (use raw values)")
     parser.add_argument("--shm-name", type=str, default="spire_imu_state",
                         help="Shared memory block name (default: spire_imu_state)")
+    parser.add_argument("--max-fail-s", type=float, default=2.0,
+                        help="Give up after this many seconds of continuous "
+                             "I2C read failure (default: 2.0)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
 
@@ -431,13 +473,15 @@ Examples:
     if not args.no_cal:
         cal = load_calibration(os.path.abspath(args.cal))
 
+    ok = False
     try:
-        sampling_loop(
+        ok = sampling_loop(
             imu, publisher, logger,
             target_rate_hz=args.rate,
             enable_mag=args.mag and mag_ok,
             duration_s=args.duration,
             cal=cal,
+            max_fail_s=args.max_fail_s,
         )
     finally:
         if logger:
@@ -445,6 +489,8 @@ Examples:
         publisher.close()
         imu.close()
         log.info("Shutdown complete.")
+    # Non-zero exit tells the supervisor the sensor failed (not a clean stop).
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
