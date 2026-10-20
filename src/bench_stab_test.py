@@ -288,14 +288,17 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
     if led:
         led.set("HOLD_STILL" if mode == "STATIC" else "ROTATE_KEEP")
 
-    rotation = fc.measure_rotation_speed(rig.shm_platform, p["measure_time"])
-
+    # Loggers start before the rotation measurement: in the CALM/HELD paths
+    # the burst begins immediately and frame 0 may be exposed before a
+    # logger started later would hold any sample.
     cam_log = fc.CamGyroLogger(rig.shm_camera)
     plat_log = fc.CamGyroLogger(rig.shm_platform)  # same ring buffer, platform shm
     servo_log = ServoTrace(rig.servo)
     cam_log.start()
     plat_log.start()
     servo_log.start()
+
+    rotation = fc.measure_rotation_speed(rig.shm_platform, p["measure_time"])
 
     pid =fc.StabilizationPID(gyro_deadband=p["gyro_deadband"],
                               d_alpha=p["d_alpha"], rate_gain=p["rate_gain"])
