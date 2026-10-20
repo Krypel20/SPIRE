@@ -179,8 +179,21 @@ class BenchRig:
             - time.clock_gettime_ns(time.CLOCK_MONOTONIC))
 
     def imu_alive(self):
-        return bool(self.imu_camera and self.imu_camera.is_alive()
-                    and self.imu_platform and self.imu_platform.is_alive())
+        return not self.dead_imus()
+
+    def dead_imus(self):
+        """Names and exit codes of IMU readers that are not running.
+
+        imu_reader.py catches any exception in its sampling loop, logs it and
+        returns normally, so a crash after an I2C error shows up as exit code 0.
+        A negative code means it was killed by that signal.
+        """
+        dead = []
+        for p in (self.imu_camera, self.imu_platform):
+            if p is None or not p.is_alive():
+                rc = p.proc.returncode if p is not None and p.proc else None
+                dead.append(f"{p.name if p else '?'} (exit {rc})")
+        return dead
 
     def stop(self):
         for name, fn in (("servo", lambda: self.servo and self.servo.close()),
@@ -502,8 +515,10 @@ def main():
     try:
         with BenchRig(session, exposure_us=args.exposure_us) as rig:
             for c in range(args.cycles):
-                if not rig.imu_alive():
-                    log.error("IMU process died, stopping session")
+                dead = rig.dead_imus()
+                if dead:
+                    log.error(f"IMU process died: {', '.join(dead)}; "
+                              "stopping session")
                     led.set("FAULT")
                     time.sleep(5)
                     break
