@@ -88,6 +88,17 @@ def setup_logging(verbose=False):
         lg.addHandler(h)
 
 
+def add_session_log(session_dir):
+    """Mirror everything printed to the console into <session>/bench.log."""
+    fh = logging.FileHandler(os.path.join(session_dir, "bench.log"))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    for name in ("spire.flight", "spire.bench", "spire.led"):
+        logging.getLogger(name).addHandler(fh)
+
+
 # ---------------------------------------------------------------------------
 # Blur model
 # ---------------------------------------------------------------------------
@@ -138,10 +149,12 @@ class BenchRig:
 
     def start(self):
         self.imu_camera = fc.IMUProcess(
-            "imu_camera", "icm20948", "spire_imu_camera", self.cam_cal, rate=500)
+            "imu_camera", "icm20948", "spire_imu_camera", self.cam_cal, rate=500,
+            log_path=os.path.join(self.output_dir, "imu_camera.log"))
         self.imu_platform = fc.IMUProcess(
             "imu_platform", "lsm9ds1", "spire_imu_platform", self.plat_cal,
-            rate=200, address="0x6B", mag=True)
+            rate=200, address="0x6B", mag=True,
+            log_path=os.path.join(self.output_dir, "imu_platform.log"))
         self.imu_camera.start()
         time.sleep(1)
         self.imu_platform.start()
@@ -504,6 +517,7 @@ def main():
                    "bench_params": bench,
                    "started_utc": datetime.now(timezone.utc).isoformat()},
                   fh, indent=2)
+    add_session_log(session)
     log.info(f"Session: {session}")
     log.info(f"Params: rate_gain={params['rate_gain']} "
              f"gyro_deadband={params['gyro_deadband']} "

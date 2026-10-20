@@ -118,9 +118,13 @@ def heading_error(current, reference):
  
 class IMUProcess:
     def __init__(self, name, sensor, shm_name, cal_path,
-                 rate=500, address=None, mag=False):
+                 rate=500, address=None, mag=False, log_path=None):
         self.name = name
         self.proc = None
+        # Child stdout+stderr go here (traceback of a crashed reader).
+        # None keeps the old behaviour (discarded).
+        self.log_path = log_path
+        self._log_fh = None
         self.sensor = sensor
         self.shm_name = shm_name
         self.cal_path = cal_path
@@ -143,9 +147,13 @@ class IMUProcess:
         if self.mag:
             cmd += ["--mag"]
         log.info(f"Starting [{self.name}]: {self.sensor} -> {self.shm_name}")
+        out = subprocess.DEVNULL
+        if self.log_path:
+            self._log_fh = open(self.log_path, "a", buffering=1)
+            out = self._log_fh
         self.proc = subprocess.Popen(
             cmd, cwd=project_dir,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=out, stderr=subprocess.STDOUT if self.log_path else out,
         )
  
     def is_alive(self):
@@ -160,6 +168,9 @@ class IMUProcess:
                 self.proc.kill()
                 self.proc.wait()
             log.info(f"[{self.name}] stopped")
+        if self._log_fh:
+            self._log_fh.close()
+            self._log_fh = None
  
 # ---------------------------------------------------------------------------
 # Camera
@@ -766,9 +777,9 @@ Examples:
                     help="Zero D-term below this |gyro_rate| deg/s (default: 0.5)")
     parser.add_argument("--d-alpha", type=float, default=0.3,
                     help="D-term low-pass factor 0-1; lower = more smoothing (default: 0.3)")
-    parser.add_argument("--rate-gain", type=float, default=1.5, # default value should be tested again if servo power is diffrent than 6.2 V
+    parser.add_argument("--rate-gain", type=float, default=1.5,
                     help="Rate-integration gain; servo counters platform N:1 (default: 1.5, "
-                         "calibrated for the servo at ~6.2V)")
+                         "calibrated for the current servo at ~6.2V)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,
