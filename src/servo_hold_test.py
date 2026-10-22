@@ -16,9 +16,14 @@ During each hold:
 Moves are ramped at a moderate speed so nothing is slammed into an end stop.
 Ctrl+C at any time centers the servo and releases it.
 
+Endpoint mode (--endpoint) steps toward each end in small increments and
+pauses at every step, to find the commanded angle where the servo reaches
+its physical end stop (a jerk or buzz on arrival, no further motion).
+
 Usage:
   python3 src/servo_hold_test.py
   python3 src/servo_hold_test.py --hold 20 --speed 45
+  python3 src/servo_hold_test.py --endpoint
 """
 
 import argparse
@@ -58,18 +63,25 @@ def main():
                     help="Hold time at the end positions in s (default 15)")
     ap.add_argument("--speed", type=float, default=60.0,
                     help="Ramp speed in commanded deg/s (default 60)")
+    ap.add_argument("--endpoint", action="store_true",
+                    help="Step 100..134 deg on each side, 3 s per step")
     args = ap.parse_args()
 
     servo = fc.ServoController(pin=12)
-    sequence = [
-        (0.0, 5.0, "center"),
-        (60.0, 5.0, "+60"),
-        (0.0, 3.0, "center"),
-        (134.0, args.hold, "+134 (flight clamp)"),
-        (0.0, 3.0, "center"),
-        (-134.0, args.hold, "-134 (flight clamp)"),
-        (0.0, 3.0, "center"),
-    ]
+    if args.endpoint:
+        steps = [100, 105, 110, 115, 120, 125, 130, 134]
+        sequence = ([(a, 3.0, f"+{a}") for a in steps] + [(0.0, 3.0, "center")]
+                    + [(-a, 3.0, f"-{a}") for a in steps] + [(0.0, 3.0, "center")])
+    else:
+        sequence = [
+            (0.0, 5.0, "center"),
+            (60.0, 5.0, "+60"),
+            (0.0, 3.0, "center"),
+            (134.0, args.hold, "+134 (flight clamp)"),
+            (0.0, 3.0, "center"),
+            (-134.0, args.hold, "-134 (flight clamp)"),
+            (0.0, 3.0, "center"),
+        ]
     try:
         servo._drive(0.0)          # attach at center
         servo.last_sent = 0.0
