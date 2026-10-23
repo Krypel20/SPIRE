@@ -494,8 +494,18 @@ class ServoController:
         self.last_sent = 0.0
 
     def detach(self):
-        # Stop pulse train -- servo goes limp (no holding torque, no jitter)
+        """Stop the pulse train: servo goes limp (no holding torque, no jitter).
+
+        The RP1 PWM stops its output immediately on disable, without finishing
+        the current period, while a new duty value is only latched at the end
+        of a period. Disabling straight away can therefore cut a pulse short;
+        the servo reads the short pulse as a large angle command and jerks
+        toward it before the signal disappears. So write duty 0 first, wait
+        two periods until it is latched (output constantly low), then disable.
+        """
         if self._attached:
+            self.pwm.change_duty_cycle(0)
+            time.sleep(2 * self.PERIOD_MS / 1000.0)
             self.pwm.stop()
             self._attached = False
 

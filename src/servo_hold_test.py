@@ -20,10 +20,17 @@ Endpoint mode (--endpoint) steps toward each end in small increments and
 pauses at every step, to find the commanded angle where the servo reaches
 its physical end stop (a jerk or buzz on arrival, no further motion).
 
+Detach test (--detach-test N) holds +60 deg, releases the servo, waits and
+attaches again, N times. With the old detach (--unsafe-detach: PWM disabled
+straight away) a pulse can be cut short and the servo twitches on release
+and jumps back on the next attach. Count the twitches for both variants.
+
 Usage:
   python3 src/servo_hold_test.py
   python3 src/servo_hold_test.py --hold 20 --speed 45
   python3 src/servo_hold_test.py --endpoint
+  python3 src/servo_hold_test.py --detach-test 40
+  python3 src/servo_hold_test.py --detach-test 40 --unsafe-detach
 """
 
 import argparse
@@ -57,6 +64,31 @@ def hold(seconds, label):
     print()
 
 
+def detach_test(servo, n, unsafe):
+    mode = "UNSAFE (immediate disable)" if unsafe else "safe (duty 0, wait, disable)"
+    print(f"Detach test, {n} cycles, {mode}. Count twitches on release and "
+          f"jumps on re-attach.", flush=True)
+    try:
+        for i in range(1, n + 1):
+            servo._drive(60.0)            # (re)attach at +60
+            servo.last_sent = 60.0
+            time.sleep(0.6)
+            if unsafe:
+                servo.pwm.stop()
+                servo._attached = False
+            else:
+                servo.detach()
+            print(f"  cycle {i:3d}/{n} released", flush=True)
+            time.sleep(0.6)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        servo._drive(60.0)
+        servo.last_sent = 60.0
+        servo.slow_center(duration=1.5)
+        servo.detach()
+
+
 def main():
     ap = argparse.ArgumentParser(description="SPIRE servo hold test")
     ap.add_argument("--hold", type=float, default=15.0,
@@ -65,9 +97,17 @@ def main():
                     help="Ramp speed in commanded deg/s (default 60)")
     ap.add_argument("--endpoint", action="store_true",
                     help="Step 100..134 deg on each side, 3 s per step")
+    ap.add_argument("--detach-test", type=int, default=0, metavar="N",
+                    help="Hold +60, release, re-attach; repeat N times")
+    ap.add_argument("--unsafe-detach", action="store_true",
+                    help="With --detach-test: disable PWM immediately "
+                         "(previous behaviour) instead of ServoController.detach()")
     args = ap.parse_args()
 
     servo = fc.ServoController(pin=12)
+    if args.detach_test:
+        detach_test(servo, args.detach_test, args.unsafe_detach)
+        return
     if args.endpoint:
         steps = [100, 105, 110, 115, 120, 125, 130, 134]
         sequence = ([(a, 3.0, f"+{a}") for a in steps] + [(0.0, 3.0, "center")]
