@@ -25,3 +25,5 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+# Per-device IMU calibration, generated on the Pi by imu_calibrate.py
+config/
