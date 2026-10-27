@@ -10,7 +10,7 @@ commands but produces no relative motion, so its gain drops to ~0.
 
 Usage:
   python3 src/servo_response.py data/bench/session_20261022_093326
-  python3 src/servo_response.py            # newest session in data/bench
+  python3 src/servo_response.py            # newest session (USB drive or ./data)
 
 Output is a short table meant to be pasted back for analysis.
 """
@@ -97,7 +97,9 @@ def main():
     if len(sys.argv) > 1:
         session = sys.argv[1]
     else:
-        sessions = sorted(glob.glob("data/bench/session_*"))
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import storage
+        sessions = storage.find_sessions("bench")
         if not sessions:
             sys.exit("no session found")
         session = sessions[-1]

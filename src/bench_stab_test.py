@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flight_capture as fc  # noqa: E402  (flight code, imported unchanged)
+import storage  # noqa: E402
 from status_led import StatusLED  # noqa: E402
 
 log = logging.getLogger("spire.bench")
@@ -514,7 +515,11 @@ def main():
     ap.add_argument("--gyro-deadband", type=float,
                     default=FLIGHT_PARAMS["gyro_deadband"])
     ap.add_argument("--no-led", action="store_true")
-    ap.add_argument("-o", "--output", default="data/bench")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Session base folder (default: /mnt/spire_data/bench "
+                         "on the USB data drive)")
+    ap.add_argument("--allow-local", action="store_true",
+                    help="Write to ./data/bench if the USB drive is missing")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     setup_logging(args.verbose)
@@ -523,7 +528,8 @@ def main():
                   gyro_deadband=args.gyro_deadband)
     bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us)
 
-    session = new_session_dir(args.output)
+    base = args.output or storage.data_dir("bench", allow_local=args.allow_local)
+    session = new_session_dir(base)
     with open(os.path.join(session, "session.json"), "w") as fh:
         json.dump({"mode": args.mode, "flight_params": params,
                    "bench_params": bench,
