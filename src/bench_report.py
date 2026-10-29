@@ -12,8 +12,9 @@ block in the report.
 Criteria (test plan, Test B):
   B-1  10-20 and 20-40 deg/s: >= 80% of CORRECTED winners |cam_gz| <= 3.4 deg/s
   B-2  5-40 deg/s: CORRECTED median attenuation <= 0.25
-  B-3  servo gain 0.9-1.1 (median over CORRECTED cycles)
-  B-4  zero NO RESPONSE cycles (servo gain < 0.15)
+  B-3  compensation ratio 0.9-1.1: share of the platform rate the servo
+       cancels, measured by the IMUs (median over responding CORRECTED cycles)
+  B-4  zero NO RESPONSE cycles (servo gain actual/commanded < 0.15)
   Mann-Whitney U, two-sided, alpha 0.05: CORRECTED vs UNCORRECTED winner rates
 
 Usage:
@@ -130,8 +131,11 @@ def load_session(path):
             meta = json.load(fh)
     fp = meta.get("flight_params", {})
     bp = meta.get("bench_params", {})
+    exp = bp.get("exposure_us", "?")
+    exp = f"auto-{bp.get('ae_mode', 'normal')}" if exp == 0 else f"{exp}us"
     config = (f"gain={fp.get('rate_gain', '?')} deadband={fp.get('gyro_deadband', '?')} "
-              f"exposure={bp.get('exposure_us', '?')}us")
+              f"exposure={exp} thr={bp.get('servo_threshold', 1.0)} "
+              f"camimu={bp.get('cam_imu_rate', 500)}")
 
     rows = []
     mpath = os.path.join(path, "manifest.csv")
@@ -168,13 +172,14 @@ def load_session(path):
             "attenuation": median(atts) if atts else None,
             "sat_share": (sum(abs(fnum(f["servo_cmd_deg"])) >= SAT_DEG for f in sat) / len(sat)
                           if sat else None),
-            "gain": None,
+            "gain": None, "comp": None,
         })
         if c["mode"] == "CORRECTED" and c["status"] == "ACTIVE":
             imu = os.path.join(path, f"c{cid:03d}_imu.csv")
             if os.path.exists(imu):
                 r = servo_response.analyse_cycle(imu)
                 c["gain"] = r["gain"] if r else None
+                c["comp"] = r["comp"] if r else None
         del c["frames"]
         out.append(c)
     return out
@@ -202,6 +207,8 @@ def summarize(cycles):
         wins = [c["winner_dps"] for c in valid if c["winner_dps"] is not None]
         atts = [c["attenuation"] for c in valid if c["attenuation"] is not None]
         gains = [c["gain"] for c in valid if c["gain"] is not None]
+        comps = [c["comp"] for c in valid if c["comp"] is not None
+                 and c["gain"] is not None and c["gain"] >= NO_RESPONSE_GAIN]
         sats = [c["sat_share"] for c in valid if c["sat_share"] is not None]
         blur = [c["winner_blur_px"] for c in valid if c["winner_blur_px"] is not None]
         wq = quartiles(wins)
@@ -214,6 +221,7 @@ def summarize(cycles):
                                 if wins else None),
             "att_med": median(atts) if atts else None,
             "gain_med": median(gains) if gains else None,
+            "comp_med": median(comps) if comps else None,
             "no_response": sum(g < NO_RESPONSE_GAIN for g in gains),
             "sat_share": sum(sats) / len(sats) if sats else None,
             "blur_med_px": median(blur) if blur else None,
@@ -252,9 +260,13 @@ def criteria(rows, cycles):
                          f"{verdict(att is not None and att <= B2_MAX_ATT, n >= 10)}")
         cg = [c["gain"] for c in cycles if c["config"] == cfg and c["valid"]
               and c["mode"] == "CORRECTED" and c["gain"] is not None]
-        g = median(cg) if cg else None
-        lines.append(f"- B-3 servo gain: median {fmt(g)} over {len(cg)} cycles: "
-                     f"{verdict(g is not None and B3_GAIN[0] <= g <= B3_GAIN[1], len(cg) >= 10)}")
+        cc = [c["comp"] for c in cycles if c["config"] == cfg and c["valid"]
+              and c["mode"] == "CORRECTED" and c["comp"] is not None
+              and c["gain"] is not None and c["gain"] >= NO_RESPONSE_GAIN]
+        k = median(cc) if cc else None
+        lines.append(f"- B-3 compensation ratio: median {fmt(k)} over {len(cc)} cycles "
+                     f"(servo scale gain {fmt(median(cg) if cg else None)}): "
+                     f"{verdict(k is not None and B3_GAIN[0] <= k <= B3_GAIN[1], len(cc) >= 10)}")
         nr = sum(x < NO_RESPONSE_GAIN for x in cg)
         lines.append(f"- B-4 NO RESPONSE cycles: {nr}: "
                      f"{verdict(nr == 0, len(cg) >= 10)}")
@@ -307,13 +319,15 @@ def main():
 
     bin_fields = ["config", "mode", "status", "bin", "n_total", "n_valid",
                   "winner_med", "winner_q1", "winner_q3", "winner_ok_share",
-                  "att_med", "gain_med", "no_response", "sat_share", "blur_med_px"]
+                  "att_med", "comp_med", "gain_med", "no_response", "sat_share",
+                  "blur_med_px"]
     with open(os.path.join(out_dir, f"{stamp}_bins.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=bin_fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
     cyc_fields = ["session", "cycle", "config", "mode", "status", "valid", "speed",
-                  "winner_dps", "winner_blur_px", "attenuation", "sat_share", "gain"]
+                  "winner_dps", "winner_blur_px", "attenuation", "sat_share", "gain",
+                  "comp"]
     with open(os.path.join(out_dir, f"{stamp}_cycles.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cyc_fields, extrasaction="ignore")
         w.writeheader()
@@ -323,7 +337,7 @@ def main():
     md = [f"# Bench report {stamp} UTC", "",
           f"Sessions: {', '.join(os.path.basename(s) for s in sessions)}", "",
           "| config | mode | status | bin deg/s | n valid/total | winner median (IQR) deg/s "
-          "| winners <= 3.4 | attenuation | servo gain | sat. share |",
+          "| winners <= 3.4 | attenuation | comp. ratio | sat. share |",
           "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for r in rows:
         iqr = (f"{fmt(r['winner_med'])} ({fmt(r['winner_q1'])}-{fmt(r['winner_q3'])})"
@@ -331,7 +345,7 @@ def main():
         md.append(f"| {r['config']} | {r['mode']} | {r['status']} | {r['bin']} | "
                   f"{r['n_valid']}/{r['n_total']} | {iqr} | "
                   f"{fmt(r['winner_ok_share'], '.0%') if r['winner_ok_share'] is not None else '-'} | "
-                  f"{fmt(r['att_med'])} | {fmt(r['gain_med'])} | "
+                  f"{fmt(r['att_med'])} | {fmt(r['comp_med'])} | "
                   f"{fmt(r['sat_share'], '.0%') if r['sat_share'] is not None else '-'} |")
     md += ["", "## Criteria", ""] + criteria(rows, cycles)
     report = "\n".join(md)

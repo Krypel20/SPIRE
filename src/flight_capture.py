@@ -455,6 +455,9 @@ class ServoController:
         from rpi_hardware_pwm import HardwarePWM
         self.pwm = HardwarePWM(pwm_channel=channel, hz=50, chip=chip)
         self.range_deg = 135.0
+        # A new pulse is sent only when the target moves more than this.
+        # Smaller = smoother motion during compensation, more PWM writes.
+        self.threshold_deg = 1.0
         self.current_position = 0.0
         self.last_sent = 0.0
         self._attached = False
@@ -474,7 +477,9 @@ class ServoController:
         else:
             self.pwm.change_duty_cycle(duty)
 
-    def set_position(self, angle_deg, threshold=1.0):
+    def set_position(self, angle_deg, threshold=None):
+        if threshold is None:
+            threshold = self.threshold_deg
         angle_deg = max(-self.range_deg, min(self.range_deg, angle_deg))
         self.current_position = angle_deg
         if abs(angle_deg - self.last_sent) > threshold:
@@ -848,6 +853,9 @@ Examples:
                     help="Zero D-term below this |gyro_rate| deg/s (default: 0.5)")
     parser.add_argument("--d-alpha", type=float, default=0.3,
                     help="D-term low-pass factor 0-1; lower = more smoothing (default: 0.3)")
+    parser.add_argument("--servo-threshold", type=float, default=1.0,
+                    help="Minimum target change in deg before a new servo pulse "
+                         "is sent (default: 1.0)")
     parser.add_argument("--rate-gain", type=float, default=1.5,
                     help="Rate-integration gain; servo counters platform N:1 (default: 1.5, "
                          "calibrated for the current servo at ~6.2V)")
@@ -942,6 +950,7 @@ Examples:
  
     # Initialize servo
     servo = ServoController(pin=args.servo_pin)
+    servo.threshold_deg = args.servo_threshold
  
     # Initialize camera
     camera = None

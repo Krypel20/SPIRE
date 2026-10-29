@@ -33,6 +33,7 @@ Output (one session directory):
 """
 
 import os
+import shutil
 import sys
 import csv
 import json
@@ -129,8 +130,12 @@ class BenchRig:
 
     def __init__(self, output_dir, cam_cal="config/imu_calibration.json",
                  plat_cal="config/lsm9ds1_calibration.json", servo_pin=12,
-                 exposure_us=BENCH_PARAMS["exposure_us"]):
+                 exposure_us=BENCH_PARAMS["exposure_us"], ae_mode="normal",
+                 cam_imu_rate=500, servo_threshold=1.0):
         self.output_dir = output_dir
+        self.ae_mode = ae_mode
+        self.cam_imu_rate = cam_imu_rate
+        self.servo_threshold = servo_threshold
         self.cam_cal = cam_cal
         self.plat_cal = plat_cal
         self.servo_pin = servo_pin
@@ -150,7 +155,8 @@ class BenchRig:
 
     def start(self):
         self.imu_camera = fc.IMUProcess(
-            "imu_camera", "icm20948", "spire_imu_camera", self.cam_cal, rate=500,
+            "imu_camera", "icm20948", "spire_imu_camera", self.cam_cal,
+            rate=self.cam_imu_rate,
             log_path=os.path.join(self.output_dir, "imu_camera.log"))
         self.imu_platform = fc.IMUProcess(
             "imu_platform", "lsm9ds1", "spire_imu_platform", self.plat_cal,
@@ -174,6 +180,7 @@ class BenchRig:
         log.info("IMU data ready")
 
         self.servo = fc.ServoController(pin=self.servo_pin)
+        self.servo.threshold_deg = self.servo_threshold
         self.camera = fc.Camera(self.output_dir)
         self.camera.init()
 
@@ -186,6 +193,18 @@ class BenchRig:
             log.info(f"Exposure locked: requested {self.exposure_us} us, "
                      f"sensor {md.get('ExposureTime')} us, "
                      f"gain {md.get('AnalogueGain', 0):.2f}")
+        else:
+            # Auto exposure. "short" asks the AE to prefer short exposure
+            # times and higher gain (exposure mode from the camera tuning).
+            if self.ae_mode == "short":
+                from libcamera import controls
+                self.camera.cam.set_controls(
+                    {"AeExposureMode": controls.AeExposureModeEnum.Short})
+            time.sleep(1.0)
+            md = self.camera.cam.capture_metadata()
+            log.info(f"Auto exposure ({self.ae_mode}): now "
+                     f"{md.get('ExposureTime')} us, gain {md.get('AnalogueGain', 0):.2f}; "
+                     f"per-frame values in manifest exposure_time_us")
 
         # SensorTimestamp is CLOCK_BOOTTIME, IMU buffers are CLOCK_MONOTONIC.
         self.boot_mono_offset_ns = (
@@ -514,6 +533,12 @@ def main():
     ap.add_argument("--rate-gain", type=float, default=FLIGHT_PARAMS["rate_gain"])
     ap.add_argument("--gyro-deadband", type=float,
                     default=FLIGHT_PARAMS["gyro_deadband"])
+    ap.add_argument("--ae-mode", choices=("normal", "short"), default="normal",
+                    help="Auto exposure mode when --exposure-us 0 (default normal)")
+    ap.add_argument("--cam-imu-rate", type=int, default=500,
+                    help="Camera IMU (ICM-20948) target rate in Hz (default 500)")
+    ap.add_argument("--servo-threshold", type=float, default=1.0,
+                    help="Servo update threshold in deg (default 1.0)")
     ap.add_argument("--no-led", action="store_true")
     ap.add_argument("-o", "--output", default=None,
                     help="Session base folder (default: /mnt/spire_data/bench "
@@ -526,7 +551,10 @@ def main():
 
     params = dict(FLIGHT_PARAMS, rate_gain=args.rate_gain,
                   gyro_deadband=args.gyro_deadband)
-    bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us)
+    bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us,
+                 ae_mode=args.ae_mode if not args.exposure_us else "locked",
+                 cam_imu_rate=args.cam_imu_rate,
+                 servo_threshold=args.servo_threshold)
 
     base = args.output or storage.data_dir("bench", allow_local=args.allow_local)
     session = new_session_dir(base)
@@ -536,6 +564,12 @@ def main():
                    "started_utc": datetime.now(timezone.utc).isoformat()},
                   fh, indent=2)
     add_session_log(session)
+    # Keep the IMU calibration used by this session next to its data.
+    for cal in ("config/imu_calibration.json", "config/lsm9ds1_calibration.json"):
+        if os.path.exists(cal):
+            shutil.copy2(cal, os.path.join(session, os.path.basename(cal)))
+        else:
+            log.warning(f"Calibration file missing: {cal}")
     log.info(f"Session: {session}")
     log.info(f"Params: rate_gain={params['rate_gain']} "
              f"gyro_deadband={params['gyro_deadband']} "
@@ -545,7 +579,9 @@ def main():
     led.set("INIT")
     cue = "HOLD_STILL" if args.mode == "STATIC" else "ROTATE_NOW"
     try:
-        with BenchRig(session, exposure_us=args.exposure_us) as rig:
+        with BenchRig(session, exposure_us=args.exposure_us, ae_mode=args.ae_mode,
+                      cam_imu_rate=args.cam_imu_rate,
+                      servo_threshold=args.servo_threshold) as rig:
             for c in range(args.cycles):
                 dead = rig.dead_imus()
                 if dead:

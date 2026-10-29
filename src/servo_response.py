@@ -57,7 +57,7 @@ def analyse_cycle(path):
     if not sv or max(abs(x) for _, x in sv) < 1.0:
         return None                      # servo not commanded (CALM/HELD)
     t0, t1 = sv[0][0], sv[-1][0]
-    gains, cmds, acts = [], [], []
+    gains, cmds, acts, comps = [], [], [], []
     a = t0
     while a + WINDOW_NS <= t1:
         b = a + WINDOW_NS
@@ -70,12 +70,17 @@ def analyse_cycle(path):
             gains.append(act / cmd)
             cmds.append(cmd)
             acts.append(act)
+            # Compensation ratio: share of the platform rate the servo cancels
+            # (cam = plat + servo, perfect when servo = -plat, ratio 1.0).
+            if abs(plat) >= 5.0:
+                comps.append(-act / plat)
         a = b
     peak = max(abs(x) for _, x in sv)
     return {
         "gain": median(gains) if gains else None,
         "cmd": median(cmds) if cmds else None,
         "act": median(acts) if acts else None,
+        "comp": median(comps) if comps else None,
         "windows": len(gains),
         "peak_cmd": peak,
         "saturated": peak >= SAT_DEG,
@@ -115,26 +120,40 @@ def main():
                 exposures.add(r.get("exposure_time_us", ""))
     print(f"Exposure values in manifest (us): {sorted(exposures)}")
 
-    print(f"{'cyc':>4} {'cmd':>7} {'actual':>7} {'gain':>5} {'peak':>6} "
+    print("gain = actual / commanded servo rate (servo scale);"
+          " comp = share of platform rate cancelled (target 1.0)")
+    print(f"{'cyc':>4} {'cmd':>7} {'actual':>7} {'gain':>5} {'comp':>5} {'peak':>6} "
           f"{'end':>7}  verdict")
+    comps_all, gains_all = [], []
     prev_sat = False
     counts = {}
     for path in sorted(glob.glob(os.path.join(session, "c*_imu.csv"))):
         cyc = os.path.basename(path)[:4]
         r = analyse_cycle(path)
         if r is None:
-            print(f"{cyc:>4} {'-':>7} {'-':>7} {'-':>5} {'-':>6} {'-':>7}  not commanded")
+            print(f"{cyc:>4} {'-':>7} {'-':>7} {'-':>5} {'-':>5} {'-':>6} {'-':>7}  not commanded")
             prev_sat = False
             continue
         v = verdict(r["gain"])
         counts[v] = counts.get(v, 0) + 1
         fmt = lambda x, f: "n/a" if x is None else format(x, f)
         note = " (prev cycle saturated)" if prev_sat else ""
+        if v == "ok":
+            if r["gain"] is not None:
+                gains_all.append(r["gain"])
+            if r["comp"] is not None:
+                comps_all.append(r["comp"])
         print(f"{cyc:>4} {fmt(r['cmd'], '+7.1f')} {fmt(r['act'], '+7.1f')} "
-              f"{fmt(r['gain'], '5.2f')} {r['peak_cmd']:6.1f} {r['end_cmd']:+7.1f}  "
+              f"{fmt(r['gain'], '5.2f')} {fmt(r['comp'], '5.2f')} "
+              f"{r['peak_cmd']:6.1f} {r['end_cmd']:+7.1f}  "
               f"{v}{' SAT' if r['saturated'] else ''}{note}")
         prev_sat = r["saturated"]
     print("Summary: " + ", ".join(f"{k} {n}" for k, n in sorted(counts.items())))
+    if gains_all and comps_all:
+        g, c = median(gains_all), median(comps_all)
+        print(f"Responding cycles: median gain {g:.2f}, median comp {c:.2f} "
+              f"(B-3 target 0.9-1.1). Rate gain for comp 1.0 = "
+              f"current rate_gain / {c:.2f}")
 
 
 if __name__ == "__main__":
