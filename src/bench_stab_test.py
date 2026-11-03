@@ -55,7 +55,7 @@ MODES = ("STATIC", "UNCORRECTED", "CORRECTED")
 
 # Flight configuration under test. Must match what the flight service runs.
 FLIGHT_PARAMS = {
-    "rate_gain": 1.5,        # calibrated at ~6.2 V servo supply
+    "rate_gain": 1.65,       # set from the IMU compensation ratio (bench 2026-10-29)
     "gyro_deadband": 0.5,    # deg/s; must equal the flight value
     "d_alpha": 0.3,
     "stabilize_time": 0.1,   # s, servo settle before burst

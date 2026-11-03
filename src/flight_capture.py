@@ -856,9 +856,10 @@ Examples:
     parser.add_argument("--servo-threshold", type=float, default=1.0,
                     help="Minimum target change in deg before a new servo pulse "
                          "is sent (default: 1.0)")
-    parser.add_argument("--rate-gain", type=float, default=1.5,
-                    help="Rate-integration gain; servo counters platform N:1 (default: 1.5, "
-                         "calibrated for the current servo at ~6.2V)")
+    parser.add_argument("--rate-gain", type=float, default=1.65,
+                    help="Rate-integration gain (default: 1.65, set so the servo "
+                         "cancels ~100%% of the platform rate, measured by the IMUs "
+                         "on the bench 2026-10-29)")
  
     # Capture gate (active compensation)
     parser.add_argument("--gate-timeout", type=float, default=2.0,

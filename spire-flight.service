@@ -20,8 +20,8 @@ User=revan
 WorkingDirectory=/home/revan/SPIRE
 ExecStartPre=/bin/sleep 20
 ExecStart=/home/revan/payload/.venv/bin/python3 src/flight_capture.py \
-    --gyro-deadband 1.5 \
-    -o data/flight
+    --gyro-deadband 0.5 \
+    -o /mnt/spire_data/flight
 Restart=always
 RestartSec=5
 # Give the camera stack time to release on restart

@@ -133,9 +133,15 @@ def load_session(path):
     bp = meta.get("bench_params", {})
     exp = bp.get("exposure_us", "?")
     exp = f"auto-{bp.get('ae_mode', 'normal')}" if exp == 0 else f"{exp}us"
-    config = (f"gain={fp.get('rate_gain', '?')} deadband={fp.get('gyro_deadband', '?')} "
-              f"exposure={exp} thr={bp.get('servo_threshold', 1.0)} "
-              f"camimu={bp.get('cam_imu_rate', 500)}")
+    baseline = f"exposure={exp} camimu={bp.get('cam_imu_rate', 500)}"
+    if meta.get("mode") in ("UNCORRECTED", "STATIC"):
+        # Servo held at centre: control parameters do not apply, so these
+        # sessions serve as the baseline for every CORRECTED configuration
+        # with the same exposure and camera IMU rate.
+        config = f"servo held {baseline}"
+    else:
+        config = (f"gain={fp.get('rate_gain', '?')} deadband={fp.get('gyro_deadband', '?')} "
+                  f"thr={bp.get('servo_threshold', 1.0)} {baseline}")
 
     rows = []
     mpath = os.path.join(path, "manifest.csv")
@@ -149,6 +155,7 @@ def load_session(path):
         cid = int(r["cycle_id"])
         c = cycles.setdefault(cid, {
             "session": os.path.basename(path), "cycle": cid, "config": config,
+            "baseline": baseline,
             "mode": r.get("mode", ""), "status": r.get("effective_status", ""),
             "valid": r.get("cycle_valid", "") in ("1", "True", "true"),
             "speed": fnum(r.get("rotation_speed_dps")) or 0.0,
@@ -213,7 +220,8 @@ def summarize(cycles):
         blur = [c["winner_blur_px"] for c in valid if c["winner_blur_px"] is not None]
         wq = quartiles(wins)
         rows.append({
-            "config": key[0], "mode": key[1], "status": key[2], "bin": bin_label(key[3]),
+            "config": key[0], "baseline": cs[0]["baseline"],
+            "mode": key[1], "status": key[2], "bin": bin_label(key[3]),
             "bin_lo": key[3][0], "n_total": len(cs), "n_valid": len(valid),
             "winner_med": wq[1] if wq else None,
             "winner_q1": wq[0] if wq else None, "winner_q3": wq[2] if wq else None,
@@ -233,10 +241,13 @@ def summarize(cycles):
 def criteria(rows, cycles):
     """Verdict lines per configuration."""
     lines = []
-    for cfg in sorted({r["config"] for r in rows}):
+    for cfg in sorted({r["config"] for r in rows if r["mode"] == "CORRECTED"}):
         rs = [r for r in rows if r["config"] == cfg]
+        base = rs[0]["baseline"]
         cor = {r["bin"]: r for r in rs if r["mode"] == "CORRECTED" and r["status"] == "ACTIVE"}
-        unc = {r["bin"]: r for r in rs if r["mode"] == "UNCORRECTED"}
+        # UNCORRECTED baseline with the same exposure and camera IMU rate
+        unc = {r["bin"]: r for r in rows
+               if r["mode"] == "UNCORRECTED" and r["baseline"] == base}
         lines.append(f"### Configuration: {cfg}")
         lines.append("")
 
