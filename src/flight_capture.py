@@ -22,6 +22,7 @@ import time
 import sys
 import os
 import math
+import bisect
 import json
 import signal
 import subprocess
@@ -41,6 +42,13 @@ CONFIG_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config"))
 CAM_CAL = os.path.join(CONFIG_DIR, "imu_calibration.json")
 PLAT_CAL = os.path.join(CONFIG_DIR, "lsm9ds1_calibration.json")
+
+# Image geometry for burst scoring (IMX477 full resolution)
+PIXEL_UM = 1.55
+SENSOR_PX = (4056, 3040)
+R_CORNER_PX = math.hypot(SENSOR_PX[0] / 2, SENSOR_PX[1] / 2)   # 2534 px
+SCORE_RADIUS_FRAC = 0.5      # yaw blur evaluated at half the corner radius
+FLIGHT_LENS_MM = 16.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -656,11 +664,16 @@ PID_STALE_NS = 50_000_000
 
 
 class CamGyroLogger(threading.Thread):
-    """High-rate ring buffer of camera gyro_z for exposure-time correlation."""
+    """High-rate ring buffer of camera gyro for exposure-time correlation.
+
+    buf  holds (mono_ns, gyro_z) as before (used by older callers);
+    buf3 holds (mono_ns, gyro_x, gyro_y, gyro_z) for the 3-axis burst score.
+    """
     def __init__(self, shm_camera, maxlen=4000):
         super().__init__(daemon=True)
         self.shm = shm_camera
         self.buf = collections.deque(maxlen=maxlen)
+        self.buf3 = collections.deque(maxlen=maxlen)
         self._stop_event = threading.Event()
 
     def run(self):
@@ -672,7 +685,10 @@ class CamGyroLogger(threading.Thread):
                 # Shared memory keeps the last sample after a reader stops;
                 # store each sample once so a frozen value is never repeated.
                 if ts != last_ts:
-                    self.buf.append((ts, c.get("gyro_z", 0.0)))
+                    gz = c.get("gyro_z", 0.0)
+                    self.buf.append((ts, gz))
+                    self.buf3.append((ts, c.get("gyro_x", 0.0),
+                                      c.get("gyro_y", 0.0), gz))
                     last_ts = ts
             time.sleep(0.002)
 
@@ -688,6 +704,84 @@ class CamGyroLogger(threading.Thread):
             if best_dt is None or dt < best_dt:
                 best_dt, best = dt, gz
         return best, best_dt
+
+    def samples3(self):
+        """Snapshot of the 3-axis buffer, sorted by time, duplicates removed."""
+        for _ in range(3):
+            try:
+                snap = list(self.buf3)
+                break
+            except RuntimeError:      # deque mutated during copy (logger running)
+                time.sleep(0.001)
+        else:
+            return []
+        out, seen = [], set()
+        for s in sorted(snap):
+            if s[0] not in seen:
+                seen.add(s[0])
+                out.append(s)
+        return out
+
+
+def exposure_motion_px(samples3, ts_ns, exp_ns, lens_mm,
+                       radius_px=SCORE_RADIUS_FRAC * R_CORNER_PX):
+    """Image motion during one exposure, from the camera gyro (3 axes).
+
+    The camera looks along its z axis (nadir, servo axis). Rotation about z
+    smears along arcs, zero at the centre and growing with radius; rotation
+    about x or y (tilt) shifts the whole image by f/pixel per radian. For each
+    axis the rate is integrated over the exposure into an angle trajectory and
+    its range (max - min) is taken, so a back-and-forth jitter inside the
+    exposure counts by how far the image actually travelled.
+
+      tilt_px = f_px * hypot(range_x, range_y)      same everywhere in the frame
+      yaw_px  = radius_px * range_z                 at radius_px from the centre
+      score   = tilt_px + yaw_px                    upper bound at radius_px
+
+    The SensorTimestamp window is uncertain (start or end of the first row's
+    exposure), so both [ts-exp, ts] and [ts, ts+exp] are evaluated and the
+    larger value is kept. Returns None if the trace does not cover either.
+    """
+    if not samples3 or not ts_ns or not exp_ns:
+        return None
+    t = [s[0] for s in samples3]
+    f_px = lens_mm * 1e-3 / (PIXEL_UM * 1e-6)
+
+    def rate(i_axis, x):
+        i = bisect.bisect_left(t, x)
+        if i <= 0:
+            return samples3[0][i_axis]
+        if i >= len(t):
+            return samples3[-1][i_axis]
+        t0, t1 = t[i - 1], t[i]
+        v0, v1 = samples3[i - 1][i_axis], samples3[i][i_axis]
+        return v0 + (v1 - v0) * (x - t0) / (t1 - t0) if t1 > t0 else v1
+
+    def window(a, b):
+        if a < t[0] or b > t[-1]:
+            return None
+        pts = [a] + [x for x in t if a < x < b] + [b]
+        if len(pts) < 3 and (b - a) > 20_000_000:   # no sample in > 20 ms
+            return None
+        ranges = []
+        for ax in (1, 2, 3):
+            ang, lo, hi = 0.0, 0.0, 0.0
+            prev = rate(ax, pts[0])
+            for k in range(1, len(pts)):
+                cur = rate(ax, pts[k])
+                ang += 0.5 * (prev + cur) * (pts[k] - pts[k - 1]) / 1e9
+                lo, hi = min(lo, ang), max(hi, ang)
+                prev = cur
+            ranges.append(math.radians(hi - lo))
+        return (f_px * math.hypot(ranges[0], ranges[1]), radius_px * ranges[2])
+
+    res = [r for r in (window(ts_ns - exp_ns, ts_ns), window(ts_ns, ts_ns + exp_ns))
+           if r is not None]
+    if not res:
+        return None
+    tilt = max(r[0] for r in res)
+    yaw = max(r[1] for r in res)
+    return {"tilt_px": tilt, "yaw_px": yaw, "score_px": tilt + yaw}
 
 # ---------------------------------------------------------------------------
 # PID thread — runs servo independently of capture timing
@@ -737,30 +831,59 @@ class PIDThread(threading.Thread):
 # Burst winner selection
 # ---------------------------------------------------------------------------
 
+SELECT_METHODS = ("gyro3", "gz")
+
+
 def pick_burst_winner(frames, cam_logger, boottime_to_mono_offset_ns,
-                      max_gap_ms=MAX_MATCH_GAP_MS):
-    """Score each burst frame by camera gyro_z at its exposure; keep the lowest.
+                      max_gap_ms=MAX_MATCH_GAP_MS, lens_mm=FLIGHT_LENS_MM,
+                      method="gyro3"):
+    """Score each burst frame and keep the best one.
+
+    method "gyro3": lowest predicted image motion during the exposure from
+        all three camera gyro axes (exposure_motion_px: tilt + yaw at half
+        the corner radius). Falls back to "gz" if no frame could be scored.
+    method "gz":    lowest |camera gyro_z| at the exposure timestamp (the
+        original rule; still computed for every frame for comparison).
 
     A frame without a sensor timestamp, or without a real gyro sample within
-    max_gap_ms of its exposure, gets exposure_cam_gz = 999 so it can only win
-    if no frame could be scored.
+    max_gap_ms of its exposure, gets 999 in both scores so it can only win if
+    no frame could be scored.
 
-    Returns:
-        (winner, frames) with exposure_cam_gz and match_gap_ms set on each frame.
+    Sets on each frame: exposure_cam_gz, match_gap_ms, exposure_tilt_px,
+    exposure_yaw_px, exposure_score_px, gz_pick (bool, the "gz" choice).
+    Returns (winner, frames).
     """
+    samples = cam_logger.samples3()
     for f in frames:
         f["exposure_cam_gz"] = 999.0
         f["match_gap_ms"] = -1.0
+        f["exposure_tilt_px"] = f["exposure_yaw_px"] = None
+        f["exposure_score_px"] = 999.0
         sts = f.get("sensor_timestamp_ns")
         if not sts:
             continue
-        gz, gap = cam_logger.gyro_at(sts - boottime_to_mono_offset_ns)
+        exp_mono = sts - boottime_to_mono_offset_ns
+        gz, gap = cam_logger.gyro_at(exp_mono)
         if gz is None:
             continue
         f["match_gap_ms"] = gap / 1e6
-        if f["match_gap_ms"] <= max_gap_ms:
-            f["exposure_cam_gz"] = gz
-    winner = min(frames, key=lambda f: abs(f["exposure_cam_gz"]))
+        if f["match_gap_ms"] > max_gap_ms:
+            continue
+        f["exposure_cam_gz"] = gz
+        m = exposure_motion_px(samples, exp_mono,
+                               int(f.get("exposure_time_us", 0) * 1000), lens_mm)
+        if m:
+            f["exposure_tilt_px"] = m["tilt_px"]
+            f["exposure_yaw_px"] = m["yaw_px"]
+            f["exposure_score_px"] = m["score_px"]
+
+    gz_winner = min(frames, key=lambda f: abs(f["exposure_cam_gz"]))
+    for f in frames:
+        f["gz_pick"] = f is gz_winner
+    if method == "gyro3" and any(f["exposure_score_px"] < 999.0 for f in frames):
+        winner = min(frames, key=lambda f: f["exposure_score_px"])
+    else:
+        winner = gz_winner
     return winner, frames
 
 # ---------------------------------------------------------------------------
@@ -846,7 +969,14 @@ Examples:
     parser.add_argument("--cam-stable-count", type=int, default=5,
                         help="Consecutive stable samples before capture (default: 5)")
     parser.add_argument("--burst-count", type=int, default=6,
-                        help="Frames per burst; keep lowest |cam_gz| (1 = no burst, default: 6)")
+                        help="Frames per burst; keep the best-scored one (1 = no burst, default: 6)")
+    parser.add_argument("--select", choices=SELECT_METHODS, default="gyro3",
+                        help="Burst winner rule: gyro3 = least image motion from all "
+                             "3 camera gyro axes over the exposure; gz = lowest "
+                             "|gyro_z| at the timestamp (default: gyro3)")
+    parser.add_argument("--lens-mm", type=float, default=FLIGHT_LENS_MM,
+                        help="Lens focal length in mm, used to convert tilt to "
+                             f"pixels (default: {FLIGHT_LENS_MM})")
     parser.add_argument("--no-burst-early", dest="burst_early", action="store_false",
                         help="Disable early burst; wait for the STABLE gate before bursting")
     parser.set_defaults(burst_early=True)
@@ -1175,20 +1305,37 @@ Examples:
                     frames = camera.capture_burst(frame_id, args.burst_count)
                     cam_logger.stop()
                     winner, scored = pick_burst_winner(
-                        frames, cam_logger, boottime_to_mono_offset_ns)
+                        frames, cam_logger, boottime_to_mono_offset_ns,
+                        lens_mm=args.lens_mm, method=args.select)
                     losers = [f for f in scored if f is not winner]
                     metadata["burst_count"] = args.burst_count
+                    metadata["burst_select"] = args.select
+                    metadata["lens_mm"] = args.lens_mm
                     metadata["burst_exposure_cam_gz"] = [
                         round(f["exposure_cam_gz"], 1) for f in scored
                     ]
+                    metadata["burst_score_px"] = [
+                        round(f["exposure_score_px"], 2) for f in scored
+                    ]
+                    metadata["burst_tilt_px"] = [
+                        None if f["exposure_tilt_px"] is None
+                        else round(f["exposure_tilt_px"], 2) for f in scored
+                    ]
+                    metadata["winner_index"] = scored.index(winner)
+                    metadata["gz_pick_index"] = next(
+                        i for i, f in enumerate(scored) if f["gz_pick"])
                     metadata["winner_exposure_cam_gz"] = round(
                         winner["exposure_cam_gz"], 1
                     )
+                    metadata["winner_score_px"] = round(winner["exposure_score_px"], 2)
                     camera.commit_burst_winner(frame_id, winner, losers, metadata)
                     log.info(
                         f"[Cycle {frame_id}] BURST {args.burst_count} frames, "
-                        f"exposure_cam_gz={metadata['burst_exposure_cam_gz']} "
-                        f"-> kept {winner['exposure_cam_gz']:+.1f} deg/s"
+                        f"score_px={metadata['burst_score_px']} "
+                        f"cam_gz={metadata['burst_exposure_cam_gz']} "
+                        f"-> kept f{metadata['winner_index']} "
+                        f"({winner['exposure_score_px']:.1f} px, {args.select}; "
+                        f"gz rule f{metadata['gz_pick_index']})"
                     )
                 else:
                     camera.capture(frame_id, metadata)

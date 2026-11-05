@@ -70,9 +70,11 @@ BENCH_PARAMS = {
     "exposure_us": 6667,         # locked shutter (1/150 s, the thesis budget); 0 = auto
     "static_max_blur_px": 1.0,   # STATIC cycle valid only below this (linear model)
     "ratio_min_plat_dps": 5.0,   # attenuation computed only above this platform rate
-    "focal_mm": 16.0,
+    "focal_mm": 16.0,            # flight lens, used by blur_px_linear only
     "pixel_um": 1.55,
     "sensor_px": (4056, 3040),
+    "lens_mm": 6.0,              # lens actually on the bench, for the burst score
+    "select": "gyro3",           # burst winner rule, see fc.pick_burst_winner
 }
 
 TRACE_MARGIN_NS = 100_000_000  # IMU trace kept 100 ms around the burst
@@ -299,6 +301,14 @@ def _trace_window(logger, t0_ns, t1_ns):
     return out
 
 
+def _nearest3(samples3, mono_ns):
+    """(gx, gy) of the 3-axis sample nearest to mono_ns, or (None, None)."""
+    if not samples3 or not mono_ns:
+        return None, None
+    s = min(samples3, key=lambda q: abs(q[0] - mono_ns))
+    return s[1], s[2]
+
+
 def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
               bench=BENCH_PARAMS, led=None):
     """Run one capture cycle in the given mode and record all burst frames.
@@ -389,7 +399,22 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
             and abs(plat_gz) >= bench["ratio_min_plat_dps"] else None)
 
     valid = [f for f in frames if f["cam_gz"] is not None]
-    winner = min(valid, key=lambda f: abs(f["cam_gz"])) if valid else None
+    # Winner by the flight rule (same function flight uses). The gz rule's
+    # choice is kept per frame for comparison.
+    winner, _ = fc.pick_burst_winner(
+        frames, cam_log, rig.boot_mono_offset_ns,
+        lens_mm=bench["lens_mm"], method=bench["select"])
+    if not valid:
+        winner = None
+    cam3 = cam_log.samples3()
+    for f in frames:
+        f["cam_gx"], f["cam_gy"] = (_nearest3(cam3, f["exp_mono_ns"])
+                                    if f["cam_gz"] is not None else (None, None))
+        f["blur_tilt_px"] = f["exposure_tilt_px"]
+        f["blur_yaw_px"] = f["exposure_yaw_px"]
+        f["score_px"] = (f["exposure_score_px"]
+                         if f["exposure_score_px"] < 999.0 else None)
+        f["winner_gz"] = bool(valid) and f["gz_pick"]
 
     # Does the cycle satisfy the condition its mode is meant to represent?
     if mode == "STATIC":
@@ -429,18 +454,22 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
         with open(os.path.join(session_dir, f"c{cycle_id:03d}_imu.csv"),
                   "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["source", "mono_ns", "gyro_z_dps"])
-            for ts, gz in _trace_window(cam_log, t0, t1):
-                w.writerow(["camera", ts, f"{gz:.4f}"])
-            for ts, gz in _trace_window(plat_log, t0, t1):
-                w.writerow(["platform", ts, f"{gz:.4f}"])
+            # gyro_x/gyro_y appended after the original columns so readers of
+            # the old format keep working.
+            w.writerow(["source", "mono_ns", "gyro_z_dps", "gyro_x_dps", "gyro_y_dps"])
+            for src, lg in (("camera", cam_log), ("platform", plat_log)):
+                for ts, gx, gy, gz in lg.samples3():
+                    if t0 <= ts <= t1:
+                        w.writerow([src, ts, f"{gz:.4f}", f"{gx:.4f}", f"{gy:.4f}"])
             for ts, v in _trace_window(servo_log, t0, t1):
-                w.writerow(["servo_cmd_deg", ts, f"{v:.2f}"])
+                w.writerow(["servo_cmd_deg", ts, f"{v:.2f}", "", ""])
 
     frame_keys = ("index", "file", "sensor_timestamp_ns", "exposure_time_us",
                   "exp_mono_ns", "cam_gz", "plat_gz", "match_gap_ms",
                   "blur_px_linear", "blur_px_rot_corner", "attenuation",
-                  "servo_cmd_deg", "servo_saturated", "winner")
+                  "servo_cmd_deg", "servo_saturated", "winner",
+                  "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
+                  "winner_gz")
     record = {
         "cycle_id": cycle_id,
         "mode": mode,
@@ -466,10 +495,16 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
     ratio_txt = f" |cam|/|plat| median {sorted(ratios)[len(ratios)//2]:.2f}" if ratios else ""
     sat = [f["index"] for f in frames if f["servo_saturated"]]
     sat_txt = f" servo saturated in f{sat}" if sat else ""
+    score_txt = ", ".join("n/a" if f["score_px"] is None else f"{f['score_px']:.1f}"
+                          for f in frames)
+    win_txt = f"f{winner['index']}" if winner else "none"
+    gz_txt = next((f"f{f['index']}" for f in frames if f["winner_gz"]), "none")
     log.info(f"[c{cycle_id:03d} {mode}/{status}] rot={rotation:.1f} deg/s "
              f"cam_gz=[{', '.join(fmt(f['cam_gz']) for f in frames)}] "
              f"servo=[{', '.join(fmt(f['servo_cmd_deg']) for f in frames)}] "
-             f"-> best {fmt(winner['cam_gz'] if winner else None)} deg/s"
+             f"score_px=[{score_txt}] -> win {win_txt} "
+             f"(cam_gz {fmt(winner['cam_gz'] if winner else None)} deg/s; "
+             f"gz rule {gz_txt})"
              f"{ratio_txt}{sat_txt}"
              + ("" if cycle_valid else f"  INVALID: {reason}"))
     return record
@@ -480,7 +515,9 @@ MANIFEST_FIELDS = ["cycle_id", "mode", "effective_status", "cycle_valid",
                    "cam_gz", "plat_gz", "attenuation", "servo_cmd_deg",
                    "servo_saturated", "blur_px_linear",
                    "blur_px_rot_corner", "match_gap_ms", "exposure_time_us",
-                   "sensor_timestamp_ns", "timestamp_utc"]
+                   "sensor_timestamp_ns", "timestamp_utc",
+                   "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
+                   "winner_gz"]
 
 
 def _r(v, n=2):
@@ -512,6 +549,11 @@ def _append_manifest(session_dir, record):
                 "exposure_time_us": f["exposure_time_us"],
                 "sensor_timestamp_ns": f["sensor_timestamp_ns"],
                 "timestamp_utc": record["timestamp_utc"],
+                "cam_gx": _r(f["cam_gx"]), "cam_gy": _r(f["cam_gy"]),
+                "blur_tilt_px": _r(f["blur_tilt_px"]),
+                "blur_yaw_px": _r(f["blur_yaw_px"]),
+                "score_px": _r(f["score_px"]),
+                "winner_gz": int(f["winner_gz"]),
             })
         fh.flush()
         os.fsync(fh.fileno())
@@ -548,6 +590,12 @@ def main():
                     help="Auto exposure mode when --exposure-us 0 (default normal)")
     ap.add_argument("--cam-imu-rate", type=int, default=500,
                     help="Camera IMU (ICM-20948) target rate in Hz (default 500)")
+    ap.add_argument("--lens-mm", type=float, default=BENCH_PARAMS["lens_mm"],
+                    help="Focal length of the lens on the bench, mm (default 6.0); "
+                         "converts camera tilt to pixels in the burst score")
+    ap.add_argument("--select", choices=fc.SELECT_METHODS,
+                    default=BENCH_PARAMS["select"],
+                    help="Burst winner rule (default gyro3; gz = old |gyro_z| rule)")
     ap.add_argument("--servo-threshold", type=float, default=1.0,
                     help="Servo update threshold in deg (default 1.0)")
     ap.add_argument("--no-led", action="store_true")
@@ -566,7 +614,8 @@ def main():
     bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us,
                  ae_mode=args.ae_mode if not args.exposure_us else "locked",
                  cam_imu_rate=args.cam_imu_rate,
-                 servo_threshold=args.servo_threshold)
+                 servo_threshold=args.servo_threshold,
+                 lens_mm=args.lens_mm, select=args.select)
 
     base = args.output or storage.data_dir("bench", allow_local=args.allow_local)
     session = new_session_dir(base)
@@ -586,6 +635,7 @@ def main():
     log.info(f"Params: rate_gain={params['rate_gain']} "
              f"gyro_deadband={params['gyro_deadband']} "
              f"min_rotation={params['min_rotation']} "
+             f"select={args.select} lens={args.lens_mm} mm "
              f"exposure={'auto' if not args.exposure_us else str(args.exposure_us) + ' us'}")
 
     led = StatusLED(enabled=not args.no_led)

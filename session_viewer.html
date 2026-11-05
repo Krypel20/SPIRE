@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPIRE Session Viewer</title>
+<!--
+SPIRE session viewer. Open this file in Edge or Chrome (double click), then
+pick or drop a session folder, or the whole deblur_data folder to get a list
+of sessions. Everything runs locally in the browser: no install, nothing is
+uploaded anywhere.
+
+Reads per session: manifest.csv, session.json, bench.log, c###_imu.csv,
+c###_meta.json, exposure_blur.csv (optional) and the JPGs. If
+exposure_blur.csv is missing, the corner blur is integrated here from the
+camera gyro trace with the same method as exposure_blur.py
+(windows A = [ts-exp, ts], B = [ts, ts+exp], r = 2534 px).
+-->
+<style>
+:root{--bg:#f6f7f8;--card:#fff;--ink:#1d2329;--mute:#66707a;--line:#dde1e5;
+--cam:#1f6fd1;--plat:#e07b12;--win:#169a5a;--bad:#c23b3b;--band:rgba(31,111,209,.10);--acc:#1f6fd1}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14181c;--card:#1d2328;--ink:#e6eaee;
+--mute:#98a2ad;--line:#323a42;--cam:#5ea2f2;--plat:#f0a04b;--win:#3fc485;--bad:#ef6b6b;
+--band:rgba(94,162,242,.14);--acc:#5ea2f2}}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--ink);
+font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.app{display:grid;grid-template-columns:260px 1fr;min-height:100vh}
+aside{border-right:1px solid var(--line);padding:12px;position:sticky;top:0;height:100vh;overflow:auto;background:var(--card)}
+aside h1{font-size:15px;margin:0 0 10px}
+.pick{display:block;border:1.5px dashed var(--line);border-radius:8px;padding:12px;text-align:center;
+color:var(--mute);cursor:pointer;font-size:13px}
+.pick.over{border-color:var(--acc);color:var(--acc)}
+.pick input{display:none}
+.slist{list-style:none;margin:12px 0 0;padding:0}
+.slist li{padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12.5px;font-variant-numeric:tabular-nums}
+.slist li:hover{background:var(--bg)}.slist li.on{background:var(--acc);color:#fff}
+.slist .sm{display:block;font-size:11px;opacity:.75}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 16px}
+header h2{font-size:16px;margin:0 0 4px}.meta{color:var(--mute);font-size:12.5px}
+.meta b{color:var(--ink);font-weight:600}
+.ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-top:8px;font-size:13px}
+.ctl select,.ctl input[type=number]{font:inherit;padding:2px 4px;background:var(--card);color:var(--ink);
+border:1px solid var(--line);border-radius:4px}.ctl input[type=number]{width:62px}
+main{padding:12px 16px 40px}
+.hello{max-width:640px;margin:60px auto;color:var(--mute)}
+.hello b{color:var(--ink)}
+.cyc{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:14px}
+.cyc h3{font-size:14px;margin:0 0 6px;display:flex;gap:12px;flex-wrap:wrap;align-items:baseline}
+.tag{font-size:11.5px;padding:1px 6px;border-radius:9px;border:1px solid var(--line);color:var(--mute)}
+.tag.inv{color:var(--bad);border-color:var(--bad)}
+svg.tr{width:100%;height:150px;display:block;margin-bottom:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
+.tile{border:1px solid var(--line);border-radius:6px;overflow:hidden;cursor:pointer;background:var(--card)}
+.tile.win{border:2px solid var(--win)}
+.tile .im{width:100%;aspect-ratio:4/3;background:var(--line);display:block;object-fit:cover}
+.tile .t{padding:5px 7px;font-size:12px;font-variant-numeric:tabular-nums}
+.tile .row{display:flex;justify-content:space-between;gap:6px}.tile .k{color:var(--mute)}
+.badge{background:var(--win);color:#fff;font-size:11px;padding:0 5px;border-radius:3px;margin-left:4px}
+.badge.gz{background:transparent;color:var(--mute);border:1px solid var(--mute)}
+.sat{color:var(--bad)}
+#lb{position:fixed;inset:0;background:rgba(0,0,0,.82);display:none;z-index:20;overflow:auto}
+#lb .in{max-width:1300px;margin:20px auto;background:var(--card);border-radius:8px;padding:14px}
+#lb .top{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}
+#lb .crops{display:grid;grid-template-columns:repeat(3,minmax(0,400px));gap:8px;justify-content:center;margin-top:10px}
+#lb figure{margin:0}#lb canvas{width:100%;display:block;image-rendering:pixelated;background:var(--line)}
+#lb figcaption{font-size:12px;color:var(--mute);text-align:center}
+#lb table{border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums;margin-top:8px}
+#lb td{padding:2px 10px 2px 0}#lb td:first-child{color:var(--mute)}
+button{font:inherit;font-size:13px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:2px 8px;cursor:pointer}
+a{color:var(--acc)}
+@media (max-width:820px){.app{grid-template-columns:1fr}aside{position:static;height:auto}
+#lb .crops{grid-template-columns:repeat(2,1fr)}}
+</style></head><body>
+<div class="app">
+<aside><h1>SPIRE Session Viewer</h1>
+<label class="pick" id="drop"><input type="file" id="dir" webkitdirectory multiple>
+Click to choose a folder<br>or drop it here<br><small>(one session, or deblur_data with many)</small></label>
+<ul class="slist" id="slist"></ul></aside>
+<div><header id="hdr" style="display:none"><h2 id="title"></h2><div class="meta" id="meta"></div>
+<div class="ctl">
+<label>View <select id="view"><option value="cycle">by cycle</option>
+<option value="score">all frames by score (3-axis)</option><option value="blur">all frames by yaw blur</option><option value="gz">all frames by |cam_gz|</option></select></label>
+<label><input type="checkbox" id="winOnly"> winners only</label>
+<label><input type="checkbox" id="validOnly"> valid cycles only</label>
+<label>blur px <input type="number" id="bmin" step="0.5" placeholder="min"> to
+<input type="number" id="bmax" step="0.5" placeholder="max"></label>
+<span class="meta" id="count"></span></div></header>
+<main id="main"><div class="hello">
+<p><b>Choose a folder</b> on the left: a single session (for example
+<code>deblur_data\session_20261105_114927</code>) or the whole <code>deblur_data</code> folder.</p>
+<p>Click a frame to see 100% crops of the centre and the four corners with the rotational blur
+predicted from the gyro. Arrow keys move between frames, Esc closes.</p></div></main></div></div>
+<div id="lb"><div class="in" id="lbin"></div></div>
+<script>
+"use strict";
+const R_CORNER=Math.hypot(4056/2,3040/2), CROP=400;
+const CROP_POS={tl:[.12,.12],tr:[.88,.12],c:[.5,.5],bl:[.12,.88],br:[.88,.88]};
+const CROP_LAB={tl:"top left",tr:"top right",c:"centre",bl:"bottom left",br:"bottom right"};
+const $=s=>document.querySelector(s);
+const n=(v,d=1)=>v==null||isNaN(v)?"–":(+v).toFixed(d);
+const sgn=(v,d=1)=>v==null||isNaN(v)?"–":(v>=0?"+":"")+(+v).toFixed(d);
+const num=v=>{if(v==null||v==="")return null;const x=Number(v);return isNaN(x)?null:x;};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+let SESS={}, S=null, thumbURLs=[], fullURL=null, cur=null;
+
+// ---------- folder intake ----------
+function addFiles(list){ // list of {path, file}
+  const groups={};
+  for(const {path,file} of list){
+    if(path.includes("/_viewer/"))continue;
+    const parts=path.split("/"); const name=parts.pop(); const dir=parts.join("/");
+    (groups[dir]=groups[dir]||{})[name]=file;
+  }
+  let added=0;
+  for(const [dir,files] of Object.entries(groups)){
+    if(!files["manifest.csv"])continue;
+    const name=dir.split("/").pop()||dir; SESS[name]={name,dir,files}; added++;
+  }
+  listSessions();
+  if(!added){$("#slist").innerHTML='<li class="meta">No folder with manifest.csv found.</li>';return;}
+  const names=Object.keys(SESS).sort();
+  if(added===1||!S) openSession(names[names.length-1]);
+}
+function listSessions(){
+  const names=Object.keys(SESS).sort().reverse();
+  $("#slist").innerHTML=names.map(nm=>{const m=nm.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+    const sm=m?`${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]} UTC`:"";
+    return `<li data-s="${esc(nm)}" class="${S&&S.name===nm?"on":""}">${esc(nm)}<span class="sm">${sm}</span></li>`;}).join("");
+}
+$("#dir").addEventListener("change",e=>{
+  addFiles([...e.target.files].map(f=>({path:f.webkitRelativePath||f.name,file:f}))); e.target.value="";});
+$("#slist").addEventListener("click",e=>{const li=e.target.closest("li[data-s]");if(li)openSession(li.dataset.s);});
+const drop=$("#drop");
+["dragenter","dragover"].forEach(t=>drop.addEventListener(t,e=>{e.preventDefault();drop.classList.add("over");}));
+["dragleave","drop"].forEach(t=>drop.addEventListener(t,()=>drop.classList.remove("over")));
+drop.addEventListener("drop",async e=>{e.preventDefault();
+  const out=[];const walk=(entry,path)=>new Promise(res=>{
+    if(entry.isFile)entry.file(f=>{out.push({path:path+entry.name,file:f});res();},()=>res());
+    else if(entry.isDirectory){const rd=entry.createReader();const all=[];
+      const more=()=>rd.readEntries(async ents=>{if(!ents.length){for(const c of all)await walk(c,path+entry.name+"/");res();}
+        else{all.push(...ents);more();}},()=>res());more();}else res();});
+  for(const it of [...e.dataTransfer.items]){const en=it.webkitGetAsEntry&&it.webkitGetAsEntry();if(en)await walk(en,"");}
+  addFiles(out);});
+
+// ---------- parsing ----------
+async function text(f){return f?await f.text():"";}
+function csv(t){const L=t.trim().split(/\r?\n/);if(L.length<2)return[];const h=L[0].split(",");
+  return L.slice(1).filter(Boolean).map(l=>{const v=l.split(",");const o={};h.forEach((k,i)=>o[k]=v[i]);return o;});}
+function rateAt(t,g,x){let lo=0,hi=t.length;while(lo<hi){const m=(lo+hi)>>1;if(t[m]<x)lo=m+1;else hi=m;}
+  const i=lo;if(i<=0)return g[0];if(i>=t.length)return g[g.length-1];const t0=t[i-1],t1=t[i];
+  return t1>t0?g[i-1]+(g[i]-g[i-1])*(x-t0)/(t1-t0):g[i];}
+function integ(t,g,a,b){ // degrees, null if not covered
+  if(!t.length||a<t[0]||b>t[t.length-1])return null;
+  const pts=[a];for(const x of t)if(x>a&&x<b)pts.push(x);pts.push(b);
+  if(pts.length<3&&(b-a)>20e6)return null;let s=0,pv=rateAt(t,g,pts[0]);
+  for(let i=1;i<pts.length;i++){const v=rateAt(t,g,pts[i]);s+=0.5*(v+pv)*(pts[i]-pts[i-1]);pv=v;}return s/1e9;}
+const px=th=>th==null?null:Math.abs(th*Math.PI/180)*R_CORNER;
+
+async function loadSession(s){
+  const F=s.files, man=csv(await text(F["manifest.csv"]));
+  let sj={};try{sj=JSON.parse(await text(F["session.json"]))}catch(e){}
+  const log=await text(F["bench.log"]);const ex=(log.split(/\r?\n/).find(l=>/Exposure locked|Auto exposure/.test(l))||"")
+    .split("spire.bench:").pop().trim();
+  const eb={};for(const r of csv(await text(F["exposure_blur.csv"])))eb[r.file]=r;
+  const info={name:s.name,mode:sj.mode||"",started:sj.started_utc||"",fp:sj.flight_params||sj.params||{},
+    bp:sj.bench_params||{},exposure:ex,hasEB:Object.keys(eb).length>0};
+  const cycles={},frames=[];
+  for(const r of man){const cid=+r.cycle_id;
+    if(!cycles[cid]){const c={id:cid,status:r.effective_status||"",valid:r.cycle_valid??"",rot:num(r.rotation_speed_dps),
+        frames:[],cam:[],plat:[],off:0};
+      // gyro trace
+      const imu=csv(await text(F[`c${String(cid).padStart(3,"0")}_imu.csv`]));
+      const tc=[],gc=[],tp=[],gp=[];
+      for(const q of imu){const tt=Number(q.mono_ns),gg=Number(q.gyro_z_dps);
+        if(q.source==="camera"){tc.push(tt);gc.push(gg);}else if(q.source==="platform"){tp.push(tt);gp.push(gg);}}
+      const so=(T,G)=>{const ix=T.map((_,i)=>i).sort((a,b)=>T[a]-T[b]);return[ix.map(i=>T[i]),ix.map(i=>G[i])];};
+      [c.tc,c.gc]=so(tc,gc);[c.tp,c.gp]=so(tp,gp);
+      try{const mj=JSON.parse(await text(F[`c${String(cid).padStart(3,"0")}_meta.json`]));
+        for(const f of mj.frames||[])if(f.sensor_timestamp_ns&&f.exp_mono_ns){c.off=f.sensor_timestamp_ns-f.exp_mono_ns;break;}}catch(e){}
+      c.t0=Math.min(c.tc.length?c.tc[0]:Infinity,c.tp.length?c.tp[0]:Infinity);if(!isFinite(c.t0))c.t0=0;
+      cycles[cid]=c;}
+    const c=cycles[cid];const ts=num(r.sensor_timestamp_ns),exp=num(r.exposure_time_us);
+    const tsm=ts!=null?ts-c.off:null;const e=eb[r.file];
+    let ba=null,bb=null,src="";
+    if(e){ba=num(e.blur_a_px);bb=num(e.blur_b_px);src="exposure_blur.csv";}
+    if(ba==null&&tsm!=null&&exp){const E=exp*1000;ba=px(integ(c.tc,c.gc,tsm-E,tsm));bb=px(integ(c.tc,c.gc,tsm,tsm+E));
+      if(ba!=null)src="gyro integral (computed here)";}
+    if(ba==null){ba=bb=num(r.blur_px_rot_corner);if(ba!=null)src="manifest (rate at ts × exposure)";}
+    const f={idx:frames.length,cycle:cid,f:+(r.frame_index||0),file:r.file,img:F[r.file]||null,
+      winner:String(r.winner)==="1",cam:num(r.cam_gz),plat:num(r.plat_gz),att:num(r.attenuation),
+      servo:num(r.servo_cmd_deg),sat:String(r.servo_saturated)==="1",gap:num(r.match_gap_ms),exp_us:exp,
+      gx:num(r.cam_gx),gy:num(r.cam_gy),tilt:num(r.blur_tilt_px),yawS:num(r.blur_yaw_px),score:num(r.score_px),
+      wgz:String(r.winner_gz)==="1",
+      ba,bb,src,t_ms:tsm!=null?(tsm-c.t0)/1e6:null,exp_ms:exp?exp/1000:null};
+    frames.push(f);c.frames.push(f.idx);}
+  return {info,cycles:Object.values(cycles).sort((a,b)=>a.id-b.id),frames};
+}
+
+// ---------- rendering ----------
+const bmaxOf=f=>f.ba==null?null:Math.max(f.ba,f.bb??f.ba);
+const cycOf=id=>S.cycles.find(c=>c.id===id);
+async function openSession(name){
+  const s=SESS[name];if(!s)return;closeLb();thumbURLs.forEach(URL.revokeObjectURL);thumbURLs=[];
+  $("#main").innerHTML='<p class="meta">Loading…</p>';
+  S=await loadSession(s);listSessions();$("#hdr").style.display="";
+  const i=S.info,p=i.fp,b=i.bp;
+  $("#title").textContent=i.name+(i.mode?"  ·  "+i.mode:"");
+  const parts=[["started",i.started?i.started.replace("T"," ").slice(0,19)+" UTC":null],["rate_gain",p.rate_gain],
+    ["deadband",p.gyro_deadband],["min_rotation",p.min_rotation],["servo_threshold",b.servo_threshold],
+    ["exposure",i.exposure||(b.exposure_us?b.exposure_us+" us":null)],["frames",S.frames.length],["cycles",S.cycles.length],
+    ["blur from",i.hasEB?"exposure_blur.csv":"gyro, computed here"]];
+  $("#meta").innerHTML=parts.filter(x=>x[1]!=null&&x[1]!=="").map(x=>esc(x[0])+" <b>"+esc(x[1])+"</b>").join(" · ");
+  render();}
+function keep(f){const c=cycOf(f.cycle);if($("#winOnly").checked&&!f.winner)return false;
+  if($("#validOnly").checked&&String(c.valid)==="0")return false;
+  const lo=parseFloat($("#bmin").value),hi=parseFloat($("#bmax").value),b=bmaxOf(f);
+  if(!isNaN(lo)&&(b==null||b<lo))return false;if(!isNaN(hi)&&(b==null||b>hi))return false;return true;}
+function tile(f){return `<div class="tile${f.winner?" win":""}" data-i="${f.idx}">
+<canvas class="im" width="4" height="3"></canvas>
+<div class="t"><div class="row"><b>c${String(f.cycle).padStart(3,"0")} f${f.f}${f.winner?'<span class="badge">WIN</span>':""}${f.wgz&&!f.winner?'<span class="badge gz">gz</span>':""}</b><span>${n(bmaxOf(f))} px</span></div>
+<div class="row"><span class="k">cam</span><span>${sgn(f.cam)} °/s</span><span class="k">plat</span><span>${sgn(f.plat)}</span></div>
+<div class="row"><span class="k">yaw blur A/B</span><span>${n(f.ba)} / ${n(f.bb)}</span></div>
+${f.score!=null?`<div class="row"><span class="k">score</span><span>${n(f.score)} px</span><span class="k">tilt</span><span>${n(f.tilt)}</span></div>`:""}
+<div class="row"><span class="k">servo</span><span class="${f.sat?"sat":""}">${sgn(f.servo)}°${f.sat?" SAT":""}</span><span class="k">att</span><span>${n(f.att,2)}</span></div></div></div>`;}
+function trace(c){const W=1000,H=150,P=28;const cam=c.tc.map((t,i)=>[(t-c.t0)/1e6,c.gc[i]]),
+  plat=c.tp.map((t,i)=>[(t-c.t0)/1e6,c.gp[i]]),all=cam.concat(plat);if(!all.length)return '<p class="meta">no gyro trace</p>';
+  let t1=0,ym=5;for(const p of all){if(p[0]>t1)t1=p[0];if(Math.abs(p[1])>ym)ym=Math.abs(p[1]);}ym=Math.ceil(ym/10)*10;
+  const X=t=>P+(W-P-6)*t/t1,Y=v=>H/2-(H/2-12)*v/ym;
+  const line=(pts,col)=>`<polyline fill="none" stroke="${col}" stroke-width="1.4" vector-effect="non-scaling-stroke" points="${pts.map(p=>X(p[0]).toFixed(1)+","+Y(p[1]).toFixed(1)).join(" ")}"/>`;
+  let s=`<svg class="tr" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+  for(const i of c.frames){const f=S.frames[i];if(f.t_ms==null)continue;const a=X(f.t_ms-f.exp_ms),m=X(f.t_ms),b=X(f.t_ms+f.exp_ms);
+    s+=`<rect x="${a}" y="4" width="${Math.max(1,m-a)}" height="${H-8}" fill="${f.winner?"rgba(22,154,90,.25)":"var(--band)"}"/>`+
+       `<rect x="${m}" y="4" width="${Math.max(1,b-m)}" height="${H-8}" fill="none" stroke="var(--mute)" stroke-opacity=".35" stroke-dasharray="3 3"/>`+
+       `<text x="${m}" y="13" font-size="11" fill="var(--mute)" text-anchor="middle">f${f.f}</text>`;}
+  s+=`<line x1="${P}" x2="${W}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/>`+
+     `<text x="2" y="${Y(ym)+4}" font-size="10" fill="var(--mute)">+${ym}</text><text x="2" y="${Y(-ym)}" font-size="10" fill="var(--mute)">-${ym}</text>`+
+     line(plat,"var(--plat)")+line(cam,"var(--cam)")+
+     `<text x="${W-6}" y="${H-6}" font-size="11" fill="var(--mute)" text-anchor="end">${t1.toFixed(0)} ms · °/s · <tspan fill="var(--cam)">camera gz</tspan> · <tspan fill="var(--plat)">platform gz</tspan> · shaded: window A · dashed: window B</text></svg>`;
+  return s;}
+function render(){if(!S)return;const v=$("#view").value;let h="",shown=0;
+  if(v==="cycle"){for(const c of S.cycles){const fs=c.frames.map(i=>S.frames[i]).filter(keep);if(!fs.length)continue;shown+=fs.length;
+      h+=`<section class="cyc"><h3>Cycle ${c.id}<span class="tag">${esc(c.status||"?")}</span>${String(c.valid)==="0"?'<span class="tag inv">INVALID</span>':""}
+<span class="meta">rotation ${n(c.rot)} °/s</span></h3>${trace(c)}<div class="grid">${fs.map(tile).join("")}</div></section>`;}}
+  else{const key=v==="blur"?bmaxOf:v==="score"?(f=>f.score):(f=>f.cam==null?null:Math.abs(f.cam));
+    const fs=S.frames.filter(keep).sort((a,b)=>(key(a)??1e9)-(key(b)??1e9));shown=fs.length;h=`<div class="grid">${fs.map(tile).join("")}</div>`;}
+  $("#main").innerHTML=h||'<p class="meta">No frames match the filters.</p>';$("#count").textContent=shown+" frames shown";
+  observeThumbs();}
+
+// ---------- thumbnails: decoded lazily, two at a time ----------
+const thumbCache=new Map();let queue=[],busy=0;
+const io=new IntersectionObserver(es=>{for(const e of es)if(e.isIntersecting){io.unobserve(e.target);queue.push(e.target);pump();}},{rootMargin:"400px"});
+function observeThumbs(){queue=[];document.querySelectorAll(".tile").forEach(t=>{const f=S.frames[+t.dataset.i];
+  const cv=t.querySelector("canvas");if(!f.img)return;if(thumbCache.has(f.img)){paint(cv,thumbCache.get(f.img));return;}io.observe(t);});}
+function paint(cv,bmp){cv.width=bmp.width;cv.height=bmp.height;cv.getContext("2d").drawImage(bmp,0,0);}
+async function pump(){while(busy<2&&queue.length){const t=queue.shift();if(!t.isConnected)continue;busy++;
+  const f=S.frames[+t.dataset.i];
+  try{let bmp=thumbCache.get(f.img);if(!bmp){bmp=await createImageBitmap(f.img,{resizeWidth:480,resizeQuality:"medium"});
+      if(bmp.width>480){const c=new OffscreenCanvas(480,Math.round(480*bmp.height/bmp.width));c.getContext("2d").drawImage(bmp,0,0,c.width,c.height);bmp=c.transferToImageBitmap();}
+      thumbCache.set(f.img,bmp);}
+    t.querySelectorAll("canvas.im").forEach(cv=>paint(cv,bmp));}catch(e){}
+  busy--;}}
+
+// ---------- frame detail ----------
+function order(){return [...document.querySelectorAll(".tile")].map(t=>+t.dataset.i);}
+async function openLb(i){cur=i;const f=S.frames[i],c=cycOf(f.cycle);
+  if(fullURL){URL.revokeObjectURL(fullURL);fullURL=null;}
+  const pred=k=>{const [fx,fy]=CROP_POS[k],r=Math.hypot((fx-.5)*4056,(fy-.5)*3040);
+    return [f.ba==null?null:f.ba*r/R_CORNER,f.bb==null?null:f.bb*r/R_CORNER];};
+  const fig=k=>{const p=pred(k);return `<figure><canvas id="cr_${k}" width="${CROP}" height="${CROP}"></canvas>
+<figcaption>${CROP_LAB[k]} · predicted yaw blur A ${n(p[0])} / B ${n(p[1])} px${f.tilt!=null?" + tilt "+n(f.tilt)+" px":""}</figcaption></figure>`;};
+  const rows=[["cycle",`${f.cycle} · ${esc(c.status)}${String(c.valid)==="0"?" · INVALID":""} · rotation ${n(c.rot)} °/s`],
+    ["winner",f.winner?"yes":"no"],["cam_gz at exposure",sgn(f.cam,2)+" °/s"],["plat_gz at exposure",sgn(f.plat,2)+" °/s"],
+    ["attenuation |cam|/|plat|",n(f.att,3)],["servo command",sgn(f.servo)+"°"+(f.sat?" (saturated)":"")],
+    ["gyro match gap",n(f.gap,2)+" ms"],["exposure",f.exp_us==null?"–":(f.exp_us/1000).toFixed(2)+" ms"],
+    ["corner yaw blur A / B",n(f.ba,2)+" / "+n(f.bb,2)+" px"],["blur source",esc(f.src||"–")],
+    ["cam gx / gy at exposure",sgn(f.gx,2)+" / "+sgn(f.gy,2)+" °/s"],
+    ["tilt blur (whole frame)",n(f.tilt,2)+" px"],["yaw blur at half radius",n(f.yawS,2)+" px"],
+    ["score (tilt + yaw)",n(f.score,2)+" px"],["old |gz| rule pick",f.wgz?"yes":"no"]];
+  $("#lbin").innerHTML=`<div class="top"><b>${esc(f.file)}</b><span>
+<button id="pv">◀ prev</button> <button id="nx">next ▶</button> <a id="full" target="_blank">full image</a> <button id="cl">close (Esc)</button></span></div>
+<table>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>
+<p class="meta">100% crops (${CROP} px). Rotation about the optical axis: centre sharp, corners smeared along arcs.
+The same smear everywhere points to tilt (pitch/roll) or translation, which the yaw gyro does not measure.</p>
+<div class="crops">${fig("tl")}<div></div>${fig("tr")}<div></div>${fig("c")}<div></div>${fig("bl")}<div></div>${fig("br")}</div>`;
+  $("#lb").style.display="block";$("#pv").onclick=()=>step(-1);$("#nx").onclick=()=>step(1);$("#cl").onclick=closeLb;
+  if(!f.img)return;fullURL=URL.createObjectURL(f.img);$("#full").href=fullURL;
+  try{const bmp=await createImageBitmap(f.img);if(cur!==i){bmp.close();return;}
+    for(const [k,[fx,fy]] of Object.entries(CROP_POS)){const cx=Math.round(fx*bmp.width),cy=Math.round(fy*bmp.height);
+      const cv=document.getElementById("cr_"+k);if(cv)cv.getContext("2d").drawImage(bmp,cx-CROP/2,cy-CROP/2,CROP,CROP,0,0,CROP,CROP);}
+    bmp.close();}catch(e){}}
+function step(d){const o=order(),k=o.indexOf(cur);if(k<0)return;openLb(o[(k+d+o.length)%o.length]);}
+function closeLb(){$("#lb").style.display="none";cur=null;}
+document.addEventListener("keydown",e=>{if(cur==null)return;if(e.key==="Escape")closeLb();
+  if(e.key==="ArrowRight")step(1);if(e.key==="ArrowLeft")step(-1);});
+$("#lb").addEventListener("click",e=>{if(e.target.id==="lb")closeLb();});
+$("#main").addEventListener("click",e=>{const t=e.target.closest(".tile");if(t)openLb(+t.dataset.i);});
+for(const id of ["view","winOnly","validOnly","bmin","bmax"])$("#"+id).addEventListener("input",render);
+</script></body></html>
