@@ -273,7 +273,7 @@ async function openLb(i){cur=i;const f=S.frames[i],c=cycOf(f.cycle);
     ["gyro match gap",n(f.gap,2)+" ms"],["exposure",f.exp_us==null?"–":(f.exp_us/1000).toFixed(2)+" ms"],
     ["corner yaw blur A / B",n(f.ba,2)+" / "+n(f.bb,2)+" px"],["blur source",esc(f.src||"–")],
     ["cam gx / gy at exposure",sgn(f.gx,2)+" / "+sgn(f.gy,2)+" °/s"],
-    ["tilt blur (whole frame)",n(f.tilt,2)+" px"],["yaw blur at half radius",n(f.yawS,2)+" px"],
+    ["tilt blur (whole frame)",n(f.tilt,2)+" px"],["yaw blur at score radius",n(f.yawS,2)+" px"],
     ["score (tilt + yaw)",n(f.score,2)+" px"],["old |gz| rule pick",f.wgz?"yes":"no"]];
   $("#lbin").innerHTML=`<div class="top"><b>${esc(f.file)}</b><span>
 <button id="pv">◀ prev</button> <button id="nx">next ▶</button> <a id="full" target="_blank">full image</a> <button id="cl">close (Esc)</button></span></div>

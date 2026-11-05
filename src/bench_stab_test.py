@@ -75,6 +75,7 @@ BENCH_PARAMS = {
     "sensor_px": (4056, 3040),
     "lens_mm": 6.0,              # lens actually on the bench, for the burst score
     "select": "gyro3",           # burst winner rule, see fc.pick_burst_winner
+    "score_radius": fc.SCORE_RADIUS_FRAC,  # yaw scored at this fraction of corner radius
 }
 
 TRACE_MARGIN_NS = 100_000_000  # IMU trace kept 100 ms around the burst
@@ -403,7 +404,8 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
     # choice is kept per frame for comparison.
     winner, _ = fc.pick_burst_winner(
         frames, cam_log, rig.boot_mono_offset_ns,
-        lens_mm=bench["lens_mm"], method=bench["select"])
+        lens_mm=bench["lens_mm"], method=bench["select"],
+        radius_frac=bench["score_radius"])
     if not valid:
         winner = None
     cam3 = cam_log.samples3()
@@ -596,6 +598,9 @@ def main():
     ap.add_argument("--select", choices=fc.SELECT_METHODS,
                     default=BENCH_PARAMS["select"],
                     help="Burst winner rule (default gyro3; gz = old |gyro_z| rule)")
+    ap.add_argument("--score-radius", type=float, default=BENCH_PARAMS["score_radius"],
+                    help="Yaw blur scored at this fraction of the corner radius "
+                         f"(default {BENCH_PARAMS['score_radius']})")
     ap.add_argument("--servo-threshold", type=float, default=1.0,
                     help="Servo update threshold in deg (default 1.0)")
     ap.add_argument("--no-led", action="store_true")
@@ -615,7 +620,8 @@ def main():
                  ae_mode=args.ae_mode if not args.exposure_us else "locked",
                  cam_imu_rate=args.cam_imu_rate,
                  servo_threshold=args.servo_threshold,
-                 lens_mm=args.lens_mm, select=args.select)
+                 lens_mm=args.lens_mm, select=args.select,
+                 score_radius=args.score_radius)
 
     base = args.output or storage.data_dir("bench", allow_local=args.allow_local)
     session = new_session_dir(base)
@@ -636,6 +642,7 @@ def main():
              f"gyro_deadband={params['gyro_deadband']} "
              f"min_rotation={params['min_rotation']} "
              f"select={args.select} lens={args.lens_mm} mm "
+             f"score_radius={args.score_radius} "
              f"exposure={'auto' if not args.exposure_us else str(args.exposure_us) + ' us'}")
 
     led = StatusLED(enabled=not args.no_led)

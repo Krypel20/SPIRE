@@ -47,7 +47,9 @@ PLAT_CAL = os.path.join(CONFIG_DIR, "lsm9ds1_calibration.json")
 PIXEL_UM = 1.55
 SENSOR_PX = (4056, 3040)
 R_CORNER_PX = math.hypot(SENSOR_PX[0] / 2, SENSOR_PX[1] / 2)   # 2534 px
-SCORE_RADIUS_FRAC = 0.5      # yaw blur evaluated at half the corner radius
+SCORE_RADIUS_FRAC = 0.25     # yaw blur evaluated at a quarter of the corner radius
+                             # (centre-weighted; bench 2026-11-05: 7-8/9 visual
+                             # picks matched at 0.1-0.4, 6/9 at 0.5, 4/9 at 1.0)
 FLIGHT_LENS_MM = 16.0
 
 # ---------------------------------------------------------------------------
@@ -836,12 +838,13 @@ SELECT_METHODS = ("gyro3", "gz")
 
 def pick_burst_winner(frames, cam_logger, boottime_to_mono_offset_ns,
                       max_gap_ms=MAX_MATCH_GAP_MS, lens_mm=FLIGHT_LENS_MM,
-                      method="gyro3"):
+                      method="gyro3", radius_frac=SCORE_RADIUS_FRAC):
     """Score each burst frame and keep the best one.
 
     method "gyro3": lowest predicted image motion during the exposure from
-        all three camera gyro axes (exposure_motion_px: tilt + yaw at half
-        the corner radius). Falls back to "gz" if no frame could be scored.
+        all three camera gyro axes (exposure_motion_px: tilt + yaw at
+        radius_frac of the corner radius). Falls back to "gz" if no frame
+        could be scored.
     method "gz":    lowest |camera gyro_z| at the exposure timestamp (the
         original rule; still computed for every frame for comparison).
 
@@ -871,7 +874,8 @@ def pick_burst_winner(frames, cam_logger, boottime_to_mono_offset_ns,
             continue
         f["exposure_cam_gz"] = gz
         m = exposure_motion_px(samples, exp_mono,
-                               int(f.get("exposure_time_us", 0) * 1000), lens_mm)
+                               int(f.get("exposure_time_us", 0) * 1000), lens_mm,
+                               radius_px=radius_frac * R_CORNER_PX)
         if m:
             f["exposure_tilt_px"] = m["tilt_px"]
             f["exposure_yaw_px"] = m["yaw_px"]
@@ -977,6 +981,9 @@ Examples:
     parser.add_argument("--lens-mm", type=float, default=FLIGHT_LENS_MM,
                         help="Lens focal length in mm, used to convert tilt to "
                              f"pixels (default: {FLIGHT_LENS_MM})")
+    parser.add_argument("--score-radius", type=float, default=SCORE_RADIUS_FRAC,
+                        help="Radius where yaw blur is scored, as a fraction of "
+                             f"the corner radius (default: {SCORE_RADIUS_FRAC})")
     parser.add_argument("--no-burst-early", dest="burst_early", action="store_false",
                         help="Disable early burst; wait for the STABLE gate before bursting")
     parser.set_defaults(burst_early=True)
@@ -1306,11 +1313,13 @@ Examples:
                     cam_logger.stop()
                     winner, scored = pick_burst_winner(
                         frames, cam_logger, boottime_to_mono_offset_ns,
-                        lens_mm=args.lens_mm, method=args.select)
+                        lens_mm=args.lens_mm, method=args.select,
+                        radius_frac=args.score_radius)
                     losers = [f for f in scored if f is not winner]
                     metadata["burst_count"] = args.burst_count
                     metadata["burst_select"] = args.select
                     metadata["lens_mm"] = args.lens_mm
+                    metadata["score_radius_frac"] = args.score_radius
                     metadata["burst_exposure_cam_gz"] = [
                         round(f["exposure_cam_gz"], 1) for f in scored
                     ]
