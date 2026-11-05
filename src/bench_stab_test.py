@@ -540,6 +540,10 @@ def main():
     ap.add_argument("--rate-gain", type=float, default=FLIGHT_PARAMS["rate_gain"])
     ap.add_argument("--gyro-deadband", type=float,
                     default=FLIGHT_PARAMS["gyro_deadband"])
+    ap.add_argument("--min-rotation", type=float,
+                    default=FLIGHT_PARAMS["min_rotation"],
+                    help="Platform rate in deg/s below which the servo is not "
+                         "engaged and the cycle is invalid for Test B (default 5.0)")
     ap.add_argument("--ae-mode", choices=("normal", "short"), default="normal",
                     help="Auto exposure mode when --exposure-us 0 (default normal)")
     ap.add_argument("--cam-imu-rate", type=int, default=500,
@@ -557,7 +561,8 @@ def main():
     setup_logging(args.verbose)
 
     params = dict(FLIGHT_PARAMS, rate_gain=args.rate_gain,
-                  gyro_deadband=args.gyro_deadband)
+                  gyro_deadband=args.gyro_deadband,
+                  min_rotation=args.min_rotation)
     bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us,
                  ae_mode=args.ae_mode if not args.exposure_us else "locked",
                  cam_imu_rate=args.cam_imu_rate,
@@ -580,6 +585,7 @@ def main():
     log.info(f"Session: {session}")
     log.info(f"Params: rate_gain={params['rate_gain']} "
              f"gyro_deadband={params['gyro_deadband']} "
+             f"min_rotation={params['min_rotation']} "
              f"exposure={'auto' if not args.exposure_us else str(args.exposure_us) + ' us'}")
 
     led = StatusLED(enabled=not args.no_led)
