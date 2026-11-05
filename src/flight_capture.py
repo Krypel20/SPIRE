@@ -34,7 +34,14 @@ import socket
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
- 
+
+# Calibration files live in <repo>/config. Resolve from this file, not from
+# the working directory, so the scripts work when started from src/ too.
+CONFIG_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config"))
+CAM_CAL = os.path.join(CONFIG_DIR, "imu_calibration.json")
+PLAT_CAL = os.path.join(CONFIG_DIR, "lsm9ds1_calibration.json")
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -897,8 +904,8 @@ Examples:
     parser.add_argument("--preview-port", type=int, default=8080)
  
     # IMU
-    parser.add_argument("--cam-cal", default="config/imu_calibration.json")
-    parser.add_argument("--plat-cal", default="config/lsm9ds1_calibration.json")
+    parser.add_argument("--cam-cal", default=CAM_CAL)
+    parser.add_argument("--plat-cal", default=PLAT_CAL)
     parser.add_argument("--diag", action="store_true",
                         help="Enable exposure-time cam_gz correlation diagnostics")
  

@@ -128,8 +128,8 @@ def blur_px(gz_dps, exposure_us, bp=BENCH_PARAMS):
 class BenchRig:
     """Owns all hardware for one bench session. Same bring-up as flight."""
 
-    def __init__(self, output_dir, cam_cal="config/imu_calibration.json",
-                 plat_cal="config/lsm9ds1_calibration.json", servo_pin=12,
+    def __init__(self, output_dir, cam_cal=fc.CAM_CAL,
+                 plat_cal=fc.PLAT_CAL, servo_pin=12,
                  exposure_us=BENCH_PARAMS["exposure_us"], ae_mode="normal",
                  cam_imu_rate=500, servo_threshold=1.0):
         self.output_dir = output_dir
@@ -146,7 +146,14 @@ class BenchRig:
         self.boot_mono_offset_ns = 0
 
     def __enter__(self):
-        self.start()
+        # __exit__ is not called when __enter__ raises, so a failure in
+        # start() (camera busy, no IMU data) must tear down what it started,
+        # otherwise the IMU reader processes keep running as orphans.
+        try:
+            self.start()
+        except BaseException:
+            self.stop()
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -565,7 +572,7 @@ def main():
                   fh, indent=2)
     add_session_log(session)
     # Keep the IMU calibration used by this session next to its data.
-    for cal in ("config/imu_calibration.json", "config/lsm9ds1_calibration.json"):
+    for cal in (fc.CAM_CAL, fc.PLAT_CAL):
         if os.path.exists(cal):
             shutil.copy2(cal, os.path.join(session, os.path.basename(cal)))
         else:
