@@ -17,8 +17,9 @@ the standard atmosphere, not geometric (GPS) altitude.
 Accuracy note: the MPRLS spec is +/-1.5 %FSS (about +/-26 hPa) over its
 compensated temperature range. That is small at ground level but large near
 20 km (about 55 hPa), so stratospheric altitude from this sensor needs a
-ground offset check and a comparison against GPS. Precision (noise) is much
-better than the accuracy figure.
+ground offset check before launch and, after the flight, a comparison with
+the radiosonde track matched by UTC time. Precision (noise) is much better
+than the accuracy figure.
 
 Usage in code:
     baro = BaroLogger()
