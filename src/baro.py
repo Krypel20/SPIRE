@@ -82,8 +82,13 @@ def counts_to_hpa(raw):
     return psi * PSI_TO_HPA
 
 
-def read_hpa(bus, addr=MPRLS_ADDR, timeout_s=0.1, retries=3):
-    """One MPRLS conversion. Returns pressure in hPa or raises."""
+def read_hpa(bus, addr=MPRLS_ADDR, timeout_s=0.1, retries=3, allow_integrity_fault=False):
+    """One MPRLS conversion. Returns (pressure hPa, status byte) or raises.
+
+    Status bit 0x04 is the sensor's own memory integrity (checksum) flag. By
+    default it raises; with allow_integrity_fault the reading is returned and
+    the caller marks it as flagged.
+    """
     from smbus2 import i2c_msg
     for _ in range(retries):
         bus.i2c_rdwr(i2c_msg.write(addr, [0xAA, 0x00, 0x00]))
@@ -94,7 +99,7 @@ def read_hpa(bus, addr=MPRLS_ADDR, timeout_s=0.1, retries=3):
             bus.i2c_rdwr(rd)
             data = list(rd)
             st = data[0]
-            if st & STATUS_INTEGRITY:
+            if st & STATUS_INTEGRITY and not allow_integrity_fault:
                 raise RuntimeError(f"MPRLS integrity fault (status 0x{st:02X})")
             if st & STATUS_MATH_SAT:
                 raise RuntimeError("MPRLS math saturation")
@@ -105,7 +110,7 @@ def read_hpa(bus, addr=MPRLS_ADDR, timeout_s=0.1, retries=3):
             time.sleep(0.001)
         raw = (data[1] << 16) | (data[2] << 8) | data[3]
         if raw:
-            return counts_to_hpa(raw)
+            return counts_to_hpa(raw), st
         time.sleep(0.005)
     raise RuntimeError("MPRLS returned zero data")
 
@@ -119,10 +124,15 @@ class BaroLogger(threading.Thread):
     so a pressure dropout never stops image capture.
     """
 
-    def __init__(self, bus=I2C_BUS, addr=MPRLS_ADDR, period_s=0.5, maxlen=7200):
+    def __init__(self, bus=I2C_BUS, addr=MPRLS_ADDR, period_s=0.5, maxlen=7200,
+                 accept_integrity_fault=True):
         super().__init__(daemon=True, name="baro")
         self.bus_no, self.addr, self.period_s = bus, addr, period_s
-        self.buf = collections.deque(maxlen=maxlen)
+        # Readings with the integrity flag set are kept but marked
+        # (baro_ok = False), so the data exists and its status is explicit.
+        self.accept_integrity_fault = accept_integrity_fault
+        self.integrity_faults = 0
+        self.buf = collections.deque(maxlen=maxlen)    # (mono_ns, hPa, ok)
         self.errors = 0
         self.first = None              # (mono_ns, hPa) of the first good sample
         self._stop_event = threading.Event()
@@ -139,15 +149,23 @@ class BaroLogger(threading.Thread):
             while not self._stop_event.is_set():
                 t0 = time.monotonic_ns()
                 try:
-                    hpa = read_hpa(bus, self.addr)
+                    hpa, st = read_hpa(bus, self.addr,
+                                       allow_integrity_fault=self.accept_integrity_fault)
                     t1 = time.monotonic_ns()
-                    sample = ((t0 + t1) // 2, hpa)
+                    ok = not st & STATUS_INTEGRITY
+                    if not ok:
+                        self.integrity_faults += 1
+                    sample = ((t0 + t1) // 2, hpa, ok)
                     self.buf.append(sample)
                     if self.first is None:
                         self.first = sample
                         alt = isa_altitude_m(hpa)
                         log.info(f"Barometer: {hpa:.2f} hPa, pressure altitude "
                                  f"{alt:.0f} m (ISA)")
+                        if not ok:
+                            log.warning(f"Barometer reports a memory integrity fault "
+                                        f"(status 0x{st:02X}); readings are kept and "
+                                        f"marked baro_ok = false")
                 except (OSError, RuntimeError) as e:
                     self.errors += 1
                     now = time.monotonic()
@@ -177,7 +195,8 @@ class BaroLogger(threading.Thread):
         around it, else the nearest one. Returns a dict with pressure_hpa,
         baro_alt_m and baro_age_ms (distance to the nearest sample); values
         are None if there is no sample within max_age_s."""
-        empty = {"pressure_hpa": None, "baro_alt_m": None, "baro_age_ms": None}
+        empty = {"pressure_hpa": None, "baro_alt_m": None, "baro_age_ms": None,
+                 "baro_ok": None}
         s = self._snapshot()
         if not s or not mono_ns:
             return empty
@@ -194,9 +213,11 @@ class BaroLogger(threading.Thread):
         else:
             hpa = near[1]
         alt = isa_altitude_m(hpa)
+        ok = all(q[2] for q in (a, b) if q)
         return {"pressure_hpa": round(hpa, 3),
                 "baro_alt_m": None if alt is None else round(alt, 1),
-                "baro_age_ms": round(age_ms, 1)}
+                "baro_age_ms": round(age_ms, 1),
+                "baro_ok": ok}
 
 
 def main():
@@ -209,7 +230,8 @@ def main():
     time.sleep(3.2)
     r = b.at(time.monotonic_ns())
     b.stop()
-    print(f"Now: {r}  ({len(b.buf)} samples, {b.errors} errors)")
+    print(f"Now: {r}  ({len(b.buf)} samples, {b.errors} errors, "
+          f"{b.integrity_faults} with integrity flag)")
 
 
 if __name__ == "__main__":

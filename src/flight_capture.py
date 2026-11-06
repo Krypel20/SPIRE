@@ -70,6 +70,9 @@ def setup_logging(verbose=False):
     console.setFormatter(fmt)
     log.setLevel(logging.DEBUG)
     log.addHandler(console)
+    baro_log = logging.getLogger("spire.baro")
+    baro_log.setLevel(level)
+    baro_log.addHandler(console)
 
 class StreamingOutput(io.BufferedIOBase):
     """MJPEG frame buffer for preview streaming."""
@@ -216,12 +219,13 @@ class Camera:
             metadata.update(self.baro.at(t))
         else:
             metadata.update({"pressure_hpa": None, "baro_alt_m": None,
-                             "baro_age_ms": None})
+                             "baro_age_ms": None, "baro_ok": None})
         return metadata
 
     def _baro_txt(self, metadata):
         p, h = metadata.get("pressure_hpa"), metadata.get("baro_alt_m")
-        return "" if p is None else f" | {p:.2f} hPa, {h:.0f} m"
+        flag = "" if metadata.get("baro_ok", True) else " (sensor integrity flag)"
+        return "" if p is None else f" | {p:.2f} hPa, {h:.0f} m{flag}"
  
     def init(self):
         from picamera2 import Picamera2
@@ -1432,7 +1436,8 @@ Examples:
             camera.close()
         if baro:
             baro.stop()
-            log.info(f"Barometer: {len(baro.buf)} samples kept, {baro.errors} read errors")
+            log.info(f"Barometer: {len(baro.buf)} samples kept, {baro.errors} read errors, "
+                     f"{baro.integrity_faults} with integrity flag")
         imu_camera.stop()
         imu_platform.stop()
         log.info(f"Total photos: {frame_id}")

@@ -88,7 +88,7 @@ def setup_logging(verbose=False):
                             datefmt="%H:%M:%S")
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(fmt)
-    for name in ("spire.bench", "spire.led"):
+    for name in ("spire.bench", "spire.led", "spire.baro"):
         lg = logging.getLogger(name)
         lg.setLevel(logging.DEBUG if verbose else logging.INFO)
         lg.addHandler(h)
@@ -101,7 +101,7 @@ def add_session_log(session_dir):
     fh.setFormatter(logging.Formatter(
         "%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"))
-    for name in ("spire.flight", "spire.bench", "spire.led"):
+    for name in ("spire.flight", "spire.bench", "spire.led", "spire.baro"):
         logging.getLogger(name).addHandler(fh)
 
 
@@ -204,9 +204,7 @@ class BenchRig:
         if self.exposure_us:
             # Fixed shutter so blur is comparable across modes and sessions;
             # gain stays automatic. Verify in manifest column exposure_time_us.
-            self.camera.cam.set_controls({"ExposureTime": int(self.exposure_us)})
-            time.sleep(0.5)
-            md = self.camera.cam.capture_metadata()
+            md = self._lock_exposure(int(self.exposure_us))
             log.info(f"Exposure locked: requested {self.exposure_us} us, "
                      f"sensor {md.get('ExposureTime')} us, "
                      f"gain {md.get('AnalogueGain', 0):.2f}")
@@ -227,6 +225,33 @@ class BenchRig:
         self.boot_mono_offset_ns = (
             time.clock_gettime_ns(time.CLOCK_BOOTTIME)
             - time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+
+    def _lock_exposure(self, exposure_us, tol=0.05):
+        """Set a fixed exposure and check that the sensor applied it.
+
+        Newer libcamera has an explicit ExposureTimeMode control; when the
+        camera offers it, it is set to Manual together with ExposureTime.
+        Several frames are checked because a control can take a few frames to
+        take effect. If the exposure still differs by more than tol, the
+        session stops: frames at the wrong exposure are not comparable.
+        """
+        cam = self.camera.cam
+        ctrls = {"ExposureTime": exposure_us}
+        if "ExposureTimeMode" in cam.camera_controls:
+            from libcamera import controls
+            ctrls["ExposureTimeMode"] = controls.ExposureTimeModeEnum.Manual
+        cam.set_controls(ctrls)
+        md = {}
+        for _ in range(10):
+            time.sleep(0.2)
+            md = cam.capture_metadata()
+            got = md.get("ExposureTime") or 0
+            if abs(got - exposure_us) <= tol * exposure_us:
+                return md
+        raise RuntimeError(
+            f"Exposure lock failed: requested {exposure_us} us, sensor still at "
+            f"{md.get('ExposureTime')} us (gain {md.get('AnalogueGain', 0):.2f}). "
+            "Frames would not be comparable; session stopped.")
 
     def imu_alive(self):
         return not self.dead_imus()
@@ -400,7 +425,8 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
         f["servo_cmd_deg"] = servo_log.value_at(f["exp_mono_ns"]) if sts else None
         baro = getattr(rig, "baro", None)
         f.update(baro.at(f["exp_mono_ns"]) if baro is not None else
-                 {"pressure_hpa": None, "baro_alt_m": None, "baro_age_ms": None})
+                 {"pressure_hpa": None, "baro_alt_m": None, "baro_age_ms": None,
+                  "baro_ok": None})
         f["servo_saturated"] = (f["servo_cmd_deg"] is not None
                                 and abs(f["servo_cmd_deg"]) >= SERVO_LIMIT_DEG)
         f["blur_px_linear"], f["blur_px_rot_corner"] = blur_px(
@@ -482,7 +508,7 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
                   "blur_px_linear", "blur_px_rot_corner", "attenuation",
                   "servo_cmd_deg", "servo_saturated", "winner",
                   "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
-                  "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms")
+                  "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms", "baro_ok")
     record = {
         "cycle_id": cycle_id,
         "mode": mode,
@@ -533,7 +559,7 @@ MANIFEST_FIELDS = ["cycle_id", "mode", "effective_status", "cycle_valid",
                    "blur_px_rot_corner", "match_gap_ms", "exposure_time_us",
                    "sensor_timestamp_ns", "timestamp_utc",
                    "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
-                   "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms"]
+                   "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms", "baro_ok"]
 
 
 def _r(v, n=2):
@@ -573,6 +599,7 @@ def _append_manifest(session_dir, record):
                 "pressure_hpa": _r(f["pressure_hpa"], 3),
                 "baro_alt_m": _r(f["baro_alt_m"], 1),
                 "baro_age_ms": _r(f["baro_age_ms"], 1),
+                "baro_ok": "" if f["baro_ok"] is None else int(f["baro_ok"]),
             })
         fh.flush()
         os.fsync(fh.fileno())

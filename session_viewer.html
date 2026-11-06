@@ -190,7 +190,7 @@ async function loadSession(s){
       servo:num(r.servo_cmd_deg),sat:String(r.servo_saturated)==="1",gap:num(r.match_gap_ms),exp_us:exp,
       gx:num(r.cam_gx),gy:num(r.cam_gy),tilt:num(r.blur_tilt_px),yawS:num(r.blur_yaw_px),score:num(r.score_px),
       wgz:String(r.winner_gz)==="1",
-      p:num(r.pressure_hpa),alt:num(r.baro_alt_m),page:num(r.baro_age_ms),
+      p:num(r.pressure_hpa),alt:num(r.baro_alt_m),page:num(r.baro_age_ms),bok:r.baro_ok,
       ba,bb,src,t_ms:tsm!=null?(tsm-c.t0)/1e6:null,exp_ms:exp?exp/1000:null};
     frames.push(f);c.frames.push(f.idx);}
   return {info,cycles:Object.values(cycles).sort((a,b)=>a.id-b.id),frames};
@@ -277,7 +277,7 @@ async function openLb(i){cur=i;const f=S.frames[i],c=cycOf(f.cycle);
     ["tilt blur (whole frame)",n(f.tilt,2)+" px"],["yaw blur at score radius",n(f.yawS,2)+" px"],
     ["score (tilt + yaw)",n(f.score,2)+" px"],["old |gz| rule pick",f.wgz?"yes":"no"],
     ["pressure at exposure",f.p==null?"–":n(f.p,2)+" hPa (nearest reading "+n(f.page,0)+" ms away)"],
-    ["pressure altitude (ISA)",f.alt==null?"–":n(f.alt,0)+" m"]];
+    ["pressure altitude (ISA)",f.alt==null?"–":n(f.alt,0)+" m"+(String(f.bok)==="0"?" (sensor integrity flag set)":"")]];
   $("#lbin").innerHTML=`<div class="top"><b>${esc(f.file)}</b><span>
 <button id="pv">◀ prev</button> <button id="nx">next ▶</button> <a id="full" target="_blank">full image</a> <button id="cl">close (Esc)</button></span></div>
 <table>${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>
