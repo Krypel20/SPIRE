@@ -36,6 +36,8 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
+from baro import BaroLogger
+
 # Calibration files live in <repo>/config. Resolve from this file, not from
 # the working directory, so the scripts work when started from src/ too.
 CONFIG_DIR = os.path.normpath(
@@ -200,6 +202,26 @@ class Camera:
         self.cam = None
         self.session_photos = []
         self.last_capture_time = 0
+        # Set by the caller: barometer and BOOTTIME-MONOTONIC offset, so each
+        # photo's metadata gets the pressure at its exposure time.
+        self.baro = None
+        self.boot_mono_offset_ns = 0
+
+    def add_baro(self, metadata):
+        """Pressure and pressure altitude at the exposure (sensor timestamp),
+        else at the time of the call. Fields are None if no reading."""
+        sts = metadata.get("sensor_timestamp_ns") or 0
+        t = sts - self.boot_mono_offset_ns if sts else time.monotonic_ns()
+        if self.baro is not None:
+            metadata.update(self.baro.at(t))
+        else:
+            metadata.update({"pressure_hpa": None, "baro_alt_m": None,
+                             "baro_age_ms": None})
+        return metadata
+
+    def _baro_txt(self, metadata):
+        p, h = metadata.get("pressure_hpa"), metadata.get("baro_alt_m")
+        return "" if p is None else f" | {p:.2f} hPa, {h:.0f} m"
  
     def init(self):
         from picamera2 import Picamera2
@@ -236,10 +258,11 @@ class Camera:
             # SensorTimestamp: hardware exposure time (ns), CLOCK_BOOTTIME domain.
             metadata["sensor_timestamp_ns"] = cam_meta.get("SensorTimestamp", 0)
             metadata["exposure_time_us"] = cam_meta.get("ExposureTime", 0)
+            self.add_baro(metadata)
             meta_path = filepath.replace(".jpg", "_meta.json")
             with open(meta_path, "w") as f:
                 json.dump(metadata, f, indent=2)
-        log.info(f"Photo {frame_id}: {filename}")
+        log.info(f"Photo {frame_id}: {filename}{self._baro_txt(metadata or {})}")
         return filepath
 
     def capture_burst(self, frame_id, n):
@@ -284,10 +307,11 @@ class Camera:
         if metadata:
             metadata["sensor_timestamp_ns"] = winner["sensor_timestamp_ns"]
             metadata["exposure_time_us"] = winner["exposure_time_us"]
+            self.add_baro(metadata)
             meta_path = filepath.replace(".jpg", "_meta.json")
             with open(meta_path, "w") as f:
                 json.dump(metadata, f, indent=2)
-        log.info(f"Photo {frame_id}: {filename}")
+        log.info(f"Photo {frame_id}: {filename}{self._baro_txt(metadata or {})}")
         return filepath
  
     def close(self):
@@ -1045,6 +1069,10 @@ Examples:
     parser.add_argument("--plat-cal", default=PLAT_CAL)
     parser.add_argument("--diag", action="store_true",
                         help="Enable exposure-time cam_gz correlation diagnostics")
+    parser.add_argument("--no-baro", action="store_true",
+                        help="Do not sample the MPRLS barometer (0x18)")
+    parser.add_argument("--baro-period", type=float, default=0.5,
+                        help="Barometer sampling period in s (default: 0.5)")
  
     parser.add_argument("-v", "--verbose", action="store_true")
  
@@ -1102,6 +1130,15 @@ Examples:
     if not args.no_camera:
         camera = Camera(args.output)
         camera.init()
+
+    # Barometer: sampled in the background; each photo gets the pressure at
+    # its exposure. A missing or failing sensor never stops capture.
+    baro = None
+    if not args.no_baro:
+        baro = BaroLogger(period_s=args.baro_period)
+        baro.start()
+    if camera:
+        camera.baro = baro
  
     # Preview server
     preview = None
@@ -1134,6 +1171,8 @@ Examples:
         time.clock_gettime_ns(time.CLOCK_BOOTTIME)
         - time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     )
+    if camera:
+        camera.boot_mono_offset_ns = boottime_to_mono_offset_ns
     if args.diag:
         log.info(f"Clock offset BOOTTIME-MONOTONIC: "
                  f"{boottime_to_mono_offset_ns/1e6:.1f} ms")
@@ -1391,6 +1430,9 @@ Examples:
             preview.stop()
         if camera:
             camera.close()
+        if baro:
+            baro.stop()
+            log.info(f"Barometer: {len(baro.buf)} samples kept, {baro.errors} read errors")
         imu_camera.stop()
         imu_platform.stop()
         log.info(f"Total photos: {frame_id}")

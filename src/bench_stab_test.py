@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import flight_capture as fc  # noqa: E402  (flight code, imported unchanged)
 import storage  # noqa: E402
 from status_led import StatusLED  # noqa: E402
+from baro import BaroLogger  # noqa: E402
 
 log = logging.getLogger("spire.bench")
 
@@ -146,6 +147,7 @@ class BenchRig:
         self.imu_camera = self.imu_platform = None
         self.shm_camera = self.shm_platform = None
         self.servo = self.camera = None
+        self.baro = None
         self.boot_mono_offset_ns = 0
 
     def __enter__(self):
@@ -188,6 +190,11 @@ class BenchRig:
             raise RuntimeError("IMU data not available after 10 s "
                                "(check I2C: 0x69, 0x6b, 0x1e must be present)")
         log.info("IMU data ready")
+
+        # Barometer in the background; a missing sensor only leaves the
+        # pressure columns empty.
+        self.baro = BaroLogger(period_s=0.5)
+        self.baro.start()
 
         self.servo = fc.ServoController(pin=self.servo_pin)
         self.servo.threshold_deg = self.servo_threshold
@@ -242,7 +249,8 @@ class BenchRig:
         for name, fn in (("servo", lambda: self.servo and self.servo.close()),
                          ("camera", lambda: self.camera and self.camera.close()),
                          ("imu_camera", lambda: self.imu_camera and self.imu_camera.stop()),
-                         ("imu_platform", lambda: self.imu_platform and self.imu_platform.stop())):
+                         ("imu_platform", lambda: self.imu_platform and self.imu_platform.stop()),
+                         ("baro", lambda: self.baro and self.baro.stop())):
             try:
                 fn()
             except Exception as e:  # keep tearing down the rest
@@ -390,6 +398,9 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
         f["plat_gz"] = plat_gz
         f["match_gap_ms"] = gap_ms
         f["servo_cmd_deg"] = servo_log.value_at(f["exp_mono_ns"]) if sts else None
+        baro = getattr(rig, "baro", None)
+        f.update(baro.at(f["exp_mono_ns"]) if baro is not None else
+                 {"pressure_hpa": None, "baro_alt_m": None, "baro_age_ms": None})
         f["servo_saturated"] = (f["servo_cmd_deg"] is not None
                                 and abs(f["servo_cmd_deg"]) >= SERVO_LIMIT_DEG)
         f["blur_px_linear"], f["blur_px_rot_corner"] = blur_px(
@@ -471,7 +482,7 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
                   "blur_px_linear", "blur_px_rot_corner", "attenuation",
                   "servo_cmd_deg", "servo_saturated", "winner",
                   "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
-                  "winner_gz")
+                  "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms")
     record = {
         "cycle_id": cycle_id,
         "mode": mode,
@@ -501,13 +512,16 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
                           for f in frames)
     win_txt = f"f{winner['index']}" if winner else "none"
     gz_txt = next((f"f{f['index']}" for f in frames if f["winner_gz"]), "none")
+    bf = winner or (frames[0] if frames else None)
+    baro_txt = ("" if not bf or bf["pressure_hpa"] is None else
+                f" p={bf['pressure_hpa']:.2f} hPa alt={bf['baro_alt_m']:.0f} m")
     log.info(f"[c{cycle_id:03d} {mode}/{status}] rot={rotation:.1f} deg/s "
              f"cam_gz=[{', '.join(fmt(f['cam_gz']) for f in frames)}] "
              f"servo=[{', '.join(fmt(f['servo_cmd_deg']) for f in frames)}] "
              f"score_px=[{score_txt}] -> win {win_txt} "
              f"(cam_gz {fmt(winner['cam_gz'] if winner else None)} deg/s; "
              f"gz rule {gz_txt})"
-             f"{ratio_txt}{sat_txt}"
+             f"{ratio_txt}{sat_txt}{baro_txt}"
              + ("" if cycle_valid else f"  INVALID: {reason}"))
     return record
 
@@ -519,7 +533,7 @@ MANIFEST_FIELDS = ["cycle_id", "mode", "effective_status", "cycle_valid",
                    "blur_px_rot_corner", "match_gap_ms", "exposure_time_us",
                    "sensor_timestamp_ns", "timestamp_utc",
                    "cam_gx", "cam_gy", "blur_tilt_px", "blur_yaw_px", "score_px",
-                   "winner_gz"]
+                   "winner_gz", "pressure_hpa", "baro_alt_m", "baro_age_ms"]
 
 
 def _r(v, n=2):
@@ -556,6 +570,9 @@ def _append_manifest(session_dir, record):
                 "blur_yaw_px": _r(f["blur_yaw_px"]),
                 "score_px": _r(f["score_px"]),
                 "winner_gz": int(f["winner_gz"]),
+                "pressure_hpa": _r(f["pressure_hpa"], 3),
+                "baro_alt_m": _r(f["baro_alt_m"], 1),
+                "baro_age_ms": _r(f["baro_age_ms"], 1),
             })
         fh.flush()
         os.fsync(fh.fileno())
