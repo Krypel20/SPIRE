@@ -69,7 +69,7 @@ FLIGHT_PARAMS = {
 # Bench-only settings
 BENCH_PARAMS = {
     "exposure_us": 6667,         # locked shutter (1/150 s, the thesis budget); 0 = auto
-    "static_max_blur_px": 1.0,   # STATIC cycle valid only below this (linear model)
+    "static_max_blur_px": 1.0,   # STATIC cycle valid only if every frame's score_px is below this
     "ratio_min_plat_dps": 5.0,   # attenuation computed only above this platform rate
     "focal_mm": 16.0,            # flight lens, used by blur_px_linear only
     "pixel_um": 1.55,
@@ -88,7 +88,8 @@ def setup_logging(verbose=False):
                             datefmt="%H:%M:%S")
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(fmt)
-    for name in ("spire.bench", "spire.led", "spire.baro"):
+    # spire.flight and spire.baro get their console handler from fc.setup_logging
+    for name in ("spire.bench", "spire.led"):
         lg = logging.getLogger(name)
         lg.setLevel(logging.DEBUG if verbose else logging.INFO)
         lg.addHandler(h)
@@ -457,11 +458,16 @@ def run_cycle(rig, mode, cycle_id, session_dir, params=FLIGHT_PARAMS,
 
     # Does the cycle satisfy the condition its mode is meant to represent?
     if mode == "STATIC":
-        worst = max((f["blur_px_linear"] or 0.0) for f in frames) if valid else None
-        cycle_valid = (len(valid) == len(frames) and worst is not None
+        # 3-axis exposure score with the bench lens. The single-sample
+        # |cam_gz| through the 16 mm linear model flagged a still platform as
+        # moving: a ~0.7 deg/s gyro bias residual alone exceeds 1 px there.
+        scores = [f["score_px"] for f in frames if f["score_px"] is not None]
+        worst = max(scores) if valid and scores else None
+        cycle_valid = (len(valid) == len(frames) and len(scores) == len(frames)
+                       and worst is not None
                        and worst <= bench["static_max_blur_px"])
         reason = "" if cycle_valid else (
-            f"platform moved: worst predicted blur {worst:.2f} px "
+            f"platform moved: worst exposure score {worst:.2f} px "
             f"> {bench['static_max_blur_px']} px" if worst is not None
             else "no exposure timestamps")
     elif mode == "UNCORRECTED":
