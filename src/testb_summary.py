@@ -193,6 +193,10 @@ def load_session(path):
         w1 = t_burst.replace(tzinfo=None) + timedelta(seconds=span + 0.1)
         n_stale = sum(w0 <= t <= w1 for t in stale)
 
+        def g(f, k, absval=False):
+            v = fnum(f[k]) if f else None
+            return abs(v) if absval and v is not None else v
+
         comp = gain = None
         src = ""
         if mode == "CORRECTED" and status == "ACTIVE":
@@ -204,15 +208,17 @@ def load_session(path):
                 comp, gain = frames_proxy(fr)
                 src = "frames (proxy)"
 
-        def g(f, k, absval=False):
-            v = fnum(f[k]) if f else None
-            return abs(v) if absval and v is not None else v
-
+        late = [abs(fnum(f["plat_gz"])) for f in fr[1:] if fnum(f["plat_gz"]) is not None]
+        p0 = abs(fnum(r0["plat_gz"]) or 0.0)
+        win_plat = g(win, "plat_gz", True)
         cycles.append({
             "session": name, "cycle": cid, "mode": mode, "status": status,
             "valid_logged": int(logged_valid), "valid": int(valid), "reason": reason,
             "rot_dps": speed, "bin": bin_label(bin_of(speed)),
             "burst_plat_med": median(plat) if plat else None,
+            "plat_speedup": (median(late) / p0 if late and p0 >= 1.0 else None),
+            "win_abs_plat": win_plat,
+            "bin_win": bin_label(bin_of(win_plat)) if win_plat is not None else "",
             "win_frame": int(win["frame_index"]) if win else None,
             "gz_frame": int(gzp["frame_index"]) if gzp else None,
             "agree": int(win is not None and gzp is not None and win is gzp),
@@ -314,6 +320,9 @@ CYC = [
     ("rot_dps", "pre-burst platform rate [deg/s]", 11, "0.0"),
     ("bin", "bin [deg/s]", 8, None),
     ("burst_plat_med", "burst median |plat_gz| [deg/s]", 11, "0.0"),
+    ("plat_speedup", "platform rate f1-f5 / f0", 9, "0.00"),
+    ("win_abs_plat", "platform |gz| at winner [deg/s]", 10, "0.0"),
+    ("bin_win", "bin by winner platform rate", 8, None),
     ("win_frame", "winner frame (gyro3)", 8, "0"),
     ("gz_frame", "gz-rule frame", 8, "0"),
     ("agree", "same frame", 7, "0"),
@@ -491,6 +500,12 @@ def main():
         br = bin_row[("CORRECTED", lab)]
         verdict_row(f"B-1 (reference) {lab} deg/s: share of gz-rule frames <= limit",
                     f"=Bins!S{br}", f"=Bins!E{br}", f"B{row}>={share_req}", None, "0%")
+    W = rng("bin_win", n)
+    for lab in ("10-20", "20-40"):
+        cnd = f'{rng("mode", n)},"CORRECTED",{rng("status", n)},"ACTIVE",{V},1,{W},"{lab}"'
+        verdict_row(f"B-1 (sensitivity) {lab} deg/s, binned by platform rate at the winner exposure",
+                    f'=IF(C{row}=0,"",COUNTIFS({cnd},{rng("win_abs_gz", n)},"<="&{lim})/C{row})',
+                    f"=COUNTIFS({cnd})", f"B{row}>={share_req}", None, "0%")
     for lab in ("5-10", "10-20", "20-40"):
         br, ur = bin_row[("CORRECTED", lab)], bin_row[("UNCORRECTED", lab)]
         verdict_row(f"B-2 {lab} deg/s: median attenuation |cam|/|plat|",
@@ -704,6 +719,10 @@ def main():
         ("Definitions", BOLD),
         ("Rotation bins use the platform rate measured during the 1 s before the burst; "
          "the same value decides CALM/ACTIVE in CORRECTED mode.", None),
+        ("With the servo active the bench platform speeds up during the burst (Cycles: "
+         "'platform rate f1-f5 / f0', median ~1.65 CORRECTED vs ~0.98 UNCORRECTED), so the "
+         "pre-burst bin understates the rate the servo works against. Criteria rows marked "
+         "'sensitivity' bin by the platform rate at the winner exposure instead.", None),
         ("Winner = burst frame chosen by the gyro3 rule: min over frames of tilt blur "
          "(f_px x tilt angle range) + yaw blur at 0.25 R (r x yaw angle range), angles "
          "integrated from the camera gyro over the exposure.", None),
