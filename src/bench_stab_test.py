@@ -632,6 +632,9 @@ def main():
     ap.add_argument("--exposure-us", type=int, default=BENCH_PARAMS["exposure_us"],
                     help="Locked shutter in us, 0 = auto exposure (default 6667)")
     ap.add_argument("--rate-gain", type=float, default=FLIGHT_PARAMS["rate_gain"])
+    ap.add_argument("--d-alpha", type=float, default=FLIGHT_PARAMS["d_alpha"],
+                    help="low-pass factor on the platform rate per control step "
+                         "(~300 Hz loop: 0.3 ~ 17 Hz corner, 0.06 ~ 3 Hz)")
     ap.add_argument("--gyro-deadband", type=float,
                     default=FLIGHT_PARAMS["gyro_deadband"])
     ap.add_argument("--min-rotation", type=float,
@@ -663,7 +666,7 @@ def main():
     args = ap.parse_args()
     setup_logging(args.verbose)
 
-    params = dict(FLIGHT_PARAMS, rate_gain=args.rate_gain,
+    params = dict(FLIGHT_PARAMS, rate_gain=args.rate_gain, d_alpha=args.d_alpha,
                   gyro_deadband=args.gyro_deadband,
                   min_rotation=args.min_rotation)
     bench = dict(BENCH_PARAMS, exposure_us=args.exposure_us,
@@ -688,7 +691,7 @@ def main():
         else:
             log.warning(f"Calibration file missing: {cal}")
     log.info(f"Session: {session}")
-    log.info(f"Params: rate_gain={params['rate_gain']} "
+    log.info(f"Params: rate_gain={params['rate_gain']} d_alpha={params['d_alpha']} "
              f"gyro_deadband={params['gyro_deadband']} "
              f"min_rotation={params['min_rotation']} "
              f"select={args.select} lens={args.lens_mm} mm "

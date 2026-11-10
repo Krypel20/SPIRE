@@ -29,10 +29,25 @@ The yaw angle per frame is read from the session manifest: blur_yaw_px is
 the yaw blur at score_radius * R_corner (default 0.25 * 2534 px), so
 angle = blur_yaw_px / (score_radius * R_corner) rad.
 
-Synthetic test (STATIC frame, blur added in linear light, inscribed circle,
+Defaults (from the 07.11 / 08.11 bench sessions): gyro kernel, exposure
+window B = [SensorTimestamp, + exposure] (won on every decidable servo-
+corrected frame; window A over-deblurs with ghost edges), Wiener SNR 30
+(higher values add grain and stripes on servo-corrected frames). A
+rolling-shutter shift (--readout-ms 30 / 60) made no visible difference.
+
+Synthetic test, SNR 100 (STATIC frame, blur added in linear light, inscribed circle,
 cubic resampling): PSNR blurred -> restored 47.8 -> 50.3 dB at 0.1 deg,
 36.5 -> 43.5 at 0.3 deg, 29.3 -> 35.5 at 0.6 deg, 23.1 -> 30.6 at 1.22 deg;
 at 0.05 deg it costs ~2 dB (53.4 -> 51.0), hence --min-blur-px.
+
+Defaults from the bench tests of 2026-11-10: gyro kernel; window B
+(SensorTimestamp = start of exposure of the first row; won against A on
+every decidable servo-corrected frame); readout 60 ms (window shifted by
+30 ms to the middle row; removed most stripes in the lower corners);
+SNR 30 (best of 30/50/100 in the synthetic test with sensor-like noise,
+0.3 deg: 35.9 -> 38.0 dB); frames under 4 px corner blur are copied
+unchanged (break-even of the noisy synthetic test lies between ~3 and
+~6 px; c012, ~5 px, visibly improved).
 
 Usage:
   python3 rot_deblur.py --session DIR --frame c002_UNCORRECTED_f1.jpg
@@ -40,7 +55,8 @@ Usage:
   python3 rot_deblur.py IMAGE --angle-deg 1.22 [--snr 100] [-o out.jpg]
   python3 rot_deblur.py IMAGE --angle-deg 1.22 --synthetic   # self-test
   python3 rot_deblur.py --session DIR --winners --kernel gyro [--window A]
-Output for --session goes to DIR/_deblur/<frame>_deblur[_gyroB][_xS].jpg. Each run
+Output for --session goes to DIR/_deblur/<frame>_deblur_gyroB_ro60_snr30.jpg (all
+parameters in the name; _box_snrN for the box kernel). Each run
 prints the processing time and the peak memory of the process.
 """
 
@@ -50,6 +66,7 @@ import json
 import math
 import os
 import resource
+import shutil
 import time
 
 import numpy as np
@@ -150,7 +167,7 @@ class PolarFilter:
         return out
 
 
-def deblur(img, angle_deg, snr=100.0, cx=None, cy=None, geom=None, linear=True, H=None):
+def deblur(img, angle_deg, snr=30.0, cx=None, cy=None, geom=None, linear=True, H=None):
     """img: HxWx3 float32 in 0..1. Returns the deblurred image. H: optional
     OTF on the angle axis (e.g. from gyro_otf); default a box of angle_deg."""
     h, w = img.shape[:2]
@@ -274,19 +291,21 @@ def main():
     ap.add_argument("--frame", help="with --session: one frame file name")
     ap.add_argument("--winners", action="store_true",
                     help="with --session: every burst winner")
-    ap.add_argument("--snr", type=float, default=100.0)
-    ap.add_argument("--kernel", choices=("box", "gyro"), default="box",
+    ap.add_argument("--snr", type=float, default=30.0,
+                    help="Wiener signal-to-noise ratio: higher sharpens more and amplifies "
+                         "noise/JPEG artefacts (30 chosen on servo-corrected frames)")
+    ap.add_argument("--kernel", choices=("box", "gyro"), default="gyro",
                     help="box: uniform rate over the yaw angle from the manifest; "
                          "gyro: kernel from the camera gyro trace in c###_imu.csv")
     ap.add_argument("--window", choices=("B", "A"), default="B",
                     help="gyro kernel exposure window: B = [ts, ts+exp] (libcamera: "
                          "SensorTimestamp = first row starts exposing), A = [ts-exp, ts]")
-    ap.add_argument("--readout-ms", type=float, default=0.0,
+    ap.add_argument("--readout-ms", type=float, default=60.0,
                     help="gyro kernel: rolling-shutter readout; the window is shifted "
                          "by half of it (middle row)")
     ap.add_argument("--angle-scale", type=float, default=1.0,
                     help="diagnostic: scale the blur angle (box) or trajectory (gyro)")
-    ap.add_argument("--min-blur-px", type=float, default=0.5,
+    ap.add_argument("--min-blur-px", type=float, default=4.0,
                     help="skip frames whose yaw blur at the frame corner is below this")
     ap.add_argument("--interp", type=int, choices=(1, 3), default=3,
                     help="polar resampling: 3 = cubic (default), 1 = linear, ~2x faster")
@@ -303,9 +322,12 @@ def main():
         jobs = frames_from_session(args.session, args.frame, args.winners)
         if not jobs:
             ap.error("no matching frames in manifest.csv (use --frame NAME or --winners)")
-        tag = "" if args.kernel == "box" else f"_gyro{args.window}"
+        # every parameter in the name, so variants never overwrite each other
+        tag = ("_box" if args.kernel == "box"
+               else f"_gyro{args.window}_ro{args.readout_ms:g}")
         if args.angle_scale != 1.0:
             tag += f"_x{args.angle_scale:g}"
+        tag += f"_snr{args.snr:g}"
         out_dir = os.path.join(args.session, "_deblur")
         os.makedirs(out_dir, exist_ok=True)
         geom = None
@@ -346,7 +368,7 @@ def main():
             corner_px = math.radians(angle) * math.hypot(w / 2, h / 2)
             name = os.path.splitext(os.path.basename(path))[0] + f"_deblur{tag}.jpg"
             if corner_px < args.min_blur_px:
-                save(img, os.path.join(out_dir, name))
+                shutil.copyfile(path, os.path.join(out_dir, name))   # bytes unchanged
                 print(f"{os.path.basename(path)}: yaw {angle:.3f} deg, corner blur "
                       f"{corner_px:.2f} px < {args.min_blur_px}, copied")
                 continue
