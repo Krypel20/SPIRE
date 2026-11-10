@@ -42,14 +42,18 @@ from bench_report import (BINS, bin_label, bin_of, fnum, mann_whitney,  # noqa: 
 import servo_response  # noqa: E402
 
 try:
+    import openpyxl
+except ImportError:
+    sys.exit("openpyxl missing: python3 -m pip install --user 'openpyxl>=3.1'")
+try:
     from openpyxl import Workbook
     from openpyxl.comments import Comment
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.formula import ArrayFormula
 except ImportError:
-    sys.exit("openpyxl missing: sudo apt install python3-openpyxl "
-             "(or pip install --break-system-packages openpyxl)")
+    sys.exit(f"openpyxl {openpyxl.__version__} is too old (needs >= 3.1 for array "
+             "formulas): python3 -m pip install --user 'openpyxl>=3.1'")
 
 # Criteria constants (test plan, Test B); written to the Criteria sheet as inputs
 WINNER_LIMIT_DPS = 3.4      # 1 px yaw blur at the frame corner at 1/150 s

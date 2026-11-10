@@ -10,6 +10,12 @@ angle axis after a Cartesian -> polar transform about the rotation centre,
 where it is removed by 1-D Wiener deconvolution and transformed back. The
 blur angle dtheta comes from the camera gyro, not from the image.
 
+Two details matter on real frames: the filter works in linear light (the
+JPEG is gamma-encoded, the blur happened in linear light), and circles that
+leave the image are bridged smoothly across the missing arc instead of being
+padded with a constant, which otherwise rings as dark lines along the image
+border.
+
 Radial lens distortion keeps circles about the principal point circular, so
 the method still applies to the 6 mm lens as long as the rotation centre is
 the principal point.
@@ -23,12 +29,18 @@ The yaw angle per frame is read from the session manifest: blur_yaw_px is
 the yaw blur at score_radius * R_corner (default 0.25 * 2534 px), so
 angle = blur_yaw_px / (score_radius * R_corner) rad.
 
+Synthetic test (STATIC frame, blur added in linear light, inscribed circle,
+cubic resampling): PSNR blurred -> restored 47.8 -> 50.3 dB at 0.1 deg,
+36.5 -> 43.5 at 0.3 deg, 29.3 -> 35.5 at 0.6 deg, 23.1 -> 30.6 at 1.22 deg;
+at 0.05 deg it costs ~2 dB (53.4 -> 51.0), hence --min-blur-px.
+
 Usage:
   python3 rot_deblur.py --session DIR --frame c002_UNCORRECTED_f1.jpg
   python3 rot_deblur.py --session DIR --winners
   python3 rot_deblur.py IMAGE --angle-deg 1.22 [--snr 100] [-o out.jpg]
   python3 rot_deblur.py IMAGE --angle-deg 1.22 --synthetic   # self-test
-Output for --session goes to DIR/_deblur/<frame>_deblur.jpg. Each run
+  python3 rot_deblur.py --session DIR --winners --kernel gyro [--window A]
+Output for --session goes to DIR/_deblur/<frame>_deblur[_gyroB][_xS].jpg. Each run
 prints the processing time and the peak memory of the process.
 """
 
@@ -43,11 +55,13 @@ import time
 import numpy as np
 from PIL import Image
 from scipy import fft as sfft
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, spline_filter
 
 SENSOR_PX = (4056, 3040)
 R_BLOCK = 128      # polar rows (radii) per block
 Y_BLOCK = 256      # output image rows per block
+GAMMA = 2.2        # sRGB JPEG -> approximately linear light
+INTERP = 3         # spline order for the polar round trip (1 = faster, lossier)
 
 
 def box_otf(n_t, length):
@@ -78,29 +92,52 @@ class PolarFilter:
         t = np.arange(self.n_t, dtype=np.float64) * 2 * math.pi / self.n_t
         self.cos_t = np.cos(t).astype(np.float32)[None, :]
         self.sin_t = np.sin(t).astype(np.float32)[None, :]
+        self.k = np.arange(self.n_t // 2 + 1, dtype=np.float32)
 
     def samples(self, angle_deg):
         return math.radians(angle_deg) / (2 * math.pi) * self.n_t
 
-    def apply(self, ch, F, fill_invalid=True):
+    def apply(self, ch, F, fill_invalid=True, band_limit=True):
         """Filter one channel along the angle axis with frequency response F."""
         h, w, n_t = self.h, self.w, self.n_t
         P = np.empty((self.n_r, n_t + 1), dtype=np.float32)
+        # cubic spline interpolation: the polar round trip alone costs ~54 dB
+        # PSNR with it vs ~42 dB with linear interpolation; prefilter once
+        cs = (spline_filter(ch, order=INTERP, output=np.float32, mode="nearest")
+              if INTERP > 1 else ch)
         for r0 in range(0, self.n_r, R_BLOCK):
             r = np.arange(r0, min(r0 + R_BLOCK, self.n_r), dtype=np.float32)[:, None]
             x = self.cx + r * self.cos_t
             y = self.cy + r * self.sin_t
-            p = map_coordinates(ch, [y, x], order=1, mode="nearest", output=np.float32)
+            p = map_coordinates(cs, [y, x], order=INTERP, mode="nearest", output=np.float32,
+                                prefilter=False)
             if fill_invalid:
                 valid = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)
+                idx = np.arange(n_t)
                 for i in np.where(~valid.all(axis=1))[0]:
                     v = valid[i]
-                    p[i, ~v] = p[i, v].mean() if v.any() else 0.0
+                    if v.sum() < 2:
+                        p[i] = p[i, v].mean() if v.any() else 0.0
+                        continue
+                    # bridge the missing arc linearly between its valid ends
+                    # (periodic), so the row has no step for the filter to ring on
+                    p[i, ~v] = np.interp(idx[~v], idx[v], p[i, v], period=n_t)
             del x, y
-            q = sfft.irfft(sfft.rfft(p, axis=1, workers=-1) * F[None, :],
+            if band_limit:
+                # angular frequency k at radius r is k / (2 pi r) cycles/px:
+                # above the image Nyquist (k > pi r) the polar row holds only
+                # interpolation error, so it is passed through, not amplified
+                Fb = np.where(self.k[None, :] <= np.pi * np.maximum(r, 1.0),
+                              F[None, :], np.complex64(1.0))
+            else:
+                Fb = F[None, :]
+            q = sfft.irfft(sfft.rfft(p, axis=1, workers=-1) * Fb,
                            n=n_t, axis=1, workers=-1)
             P[r0:r0 + q.shape[0], :n_t] = q
+        del cs
         P[:, n_t] = P[:, 0]                      # periodic angle axis
+        if INTERP > 1:
+            P = spline_filter(P, order=INTERP, output=np.float32, mode="nearest")
         out = np.empty((h, w), dtype=np.float32)
         xs = np.arange(w, dtype=np.float32)[None, :] - self.cx
         scale = n_t / (2 * math.pi)
@@ -109,28 +146,36 @@ class PolarFilter:
             rr = np.hypot(xs, ys)
             tt = np.mod(np.arctan2(ys, xs), 2 * math.pi) * scale
             out[y0:y0 + ys.shape[0]] = map_coordinates(
-                P, [rr, tt], order=1, mode="nearest", output=np.float32)
+                P, [rr, tt], order=INTERP, mode="nearest", output=np.float32, prefilter=False)
         return out
 
 
-def deblur(img, angle_deg, snr=100.0, cx=None, cy=None, geom=None):
-    """img: HxWx3 float32 in 0..1. Returns the deblurred image."""
+def deblur(img, angle_deg, snr=100.0, cx=None, cy=None, geom=None, linear=True, H=None):
+    """img: HxWx3 float32 in 0..1. Returns the deblurred image. H: optional
+    OTF on the angle axis (e.g. from gyro_otf); default a box of angle_deg."""
     h, w = img.shape[:2]
     geom = geom or PolarFilter(h, w, cx, cy)
-    H = box_otf(geom.n_t, geom.samples(angle_deg))
-    W = (np.conj(H) / (np.abs(H) ** 2 + 1.0 / snr)).astype(np.complex64)
+    if H is None:
+        H = box_otf(geom.n_t, geom.samples(angle_deg))
+    W = np.conj(H) / (np.abs(H) ** 2 + 1.0 / snr)
+    W = (W / W[0].real).astype(np.complex64)   # unit DC gain: no brightness loss
+    lin = np.power(img, GAMMA) if linear else img
     out = np.empty_like(img)
     for c in range(img.shape[2]):
-        out[:, :, c] = geom.apply(img[:, :, c], W)
-    return np.clip(out, 0, 1, out=out)
+        out[:, :, c] = geom.apply(lin[:, :, c], W)
+    np.clip(out, 0, 1, out=out)
+    return np.power(out, 1 / GAMMA, out=out) if linear else out
 
 
 def blur(img, angle_deg, geom):
+    """Synthetic rotational blur, applied in linear light like a real exposure."""
     H = box_otf(geom.n_t, geom.samples(angle_deg)).astype(np.complex64)
+    lin = np.power(img, GAMMA)
     out = np.empty_like(img)
     for c in range(img.shape[2]):
-        out[:, :, c] = geom.apply(img[:, :, c], H, fill_invalid=False)
-    return np.clip(out, 0, 1, out=out)
+        out[:, :, c] = geom.apply(lin[:, :, c], H, fill_invalid=False, band_limit=False)
+    np.clip(out, 0, 1, out=out)
+    return np.power(out, 1 / GAMMA, out=out)
 
 
 def psnr(a, b):
@@ -144,6 +189,56 @@ def load(path):
 
 def save(img, path):
     Image.fromarray((img * 255 + 0.5).astype(np.uint8)).save(path, quality=95)
+
+
+def load_gz(path):
+    """Camera gyro z trace (mono_ns, deg/s) from a c###_imu.csv."""
+    t, g = [], []
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            if r.get("source") == "camera":
+                t.append(int(r["mono_ns"]))
+                g.append(float(r["gyro_z_dps"]))
+    o = np.argsort(t)
+    return np.asarray(t, dtype=np.int64)[o], np.asarray(g, dtype=np.float64)[o]
+
+
+def boot_offset(session, cycle):
+    """SensorTimestamp (BOOTTIME) minus CLOCK_MONOTONIC from c###_meta.json."""
+    try:
+        with open(os.path.join(session, f"c{cycle:03d}_meta.json")) as fh:
+            for f in json.load(fh).get("frames", []):
+                if f.get("sensor_timestamp_ns") and f.get("exp_mono_ns"):
+                    return f["sensor_timestamp_ns"] - f["exp_mono_ns"]
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def angle_trace(t, g, a, b, n=400):
+    """Yaw angle (deg) over [a, b] ns, integrated from the gyro rate; None if
+    the trace does not cover the window."""
+    if len(t) < 2 or a < t[0] or b > t[-1]:
+        return None
+    ts = np.linspace(a, b, n)
+    rate = np.interp(ts, t, g)
+    dt = np.diff(ts) / 1e9
+    return np.concatenate([[0.0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * dt)])
+
+
+def gyro_otf(n_t, theta_deg):
+    """OTF on the angle axis from the angle trajectory: the kernel is the time
+    the camera spent at each angle, so a rate that changes during the
+    exposure gives the matching non-uniform kernel instead of a box."""
+    s = np.radians(theta_deg) / (2 * math.pi) * n_t
+    s = s - 0.5 * (s.max() + s.min())
+    k = np.zeros(n_t, dtype=np.float64)
+    i0 = np.floor(s).astype(np.int64)
+    f = s - i0
+    np.add.at(k, i0 % n_t, 1 - f)
+    np.add.at(k, (i0 + 1) % n_t, f)
+    k /= k.sum()
+    return np.fft.rfft(k)
 
 
 def frames_from_session(session, frame=None, winners=False):
@@ -180,22 +275,41 @@ def main():
     ap.add_argument("--winners", action="store_true",
                     help="with --session: every burst winner")
     ap.add_argument("--snr", type=float, default=100.0)
+    ap.add_argument("--kernel", choices=("box", "gyro"), default="box",
+                    help="box: uniform rate over the yaw angle from the manifest; "
+                         "gyro: kernel from the camera gyro trace in c###_imu.csv")
+    ap.add_argument("--window", choices=("B", "A"), default="B",
+                    help="gyro kernel exposure window: B = [ts, ts+exp] (libcamera: "
+                         "SensorTimestamp = first row starts exposing), A = [ts-exp, ts]")
+    ap.add_argument("--readout-ms", type=float, default=0.0,
+                    help="gyro kernel: rolling-shutter readout; the window is shifted "
+                         "by half of it (middle row)")
+    ap.add_argument("--angle-scale", type=float, default=1.0,
+                    help="diagnostic: scale the blur angle (box) or trajectory (gyro)")
     ap.add_argument("--min-blur-px", type=float, default=0.5,
                     help="skip frames whose yaw blur at the frame corner is below this")
+    ap.add_argument("--interp", type=int, choices=(1, 3), default=3,
+                    help="polar resampling: 3 = cubic (default), 1 = linear, ~2x faster")
     ap.add_argument("--cx", type=float)
     ap.add_argument("--cy", type=float)
     ap.add_argument("--synthetic", action="store_true",
                     help="blur the (sharp) input first, then deblur and report PSNR")
     ap.add_argument("-o", "--output", default="deblurred.jpg")
     args = ap.parse_args()
+    global INTERP
+    INTERP = args.interp
 
     if args.session:
         jobs = frames_from_session(args.session, args.frame, args.winners)
         if not jobs:
             ap.error("no matching frames in manifest.csv (use --frame NAME or --winners)")
+        tag = "" if args.kernel == "box" else f"_gyro{args.window}"
+        if args.angle_scale != 1.0:
+            tag += f"_x{args.angle_scale:g}"
         out_dir = os.path.join(args.session, "_deblur")
         os.makedirs(out_dir, exist_ok=True)
         geom = None
+        traces = {}
         for path, angle, r in jobs:
             if not os.path.exists(path):
                 print(f"missing {path}, skipped")
@@ -205,16 +319,40 @@ def main():
             h, w = img.shape[:2]
             if geom is None or (geom.h, geom.w) != (h, w):
                 geom = PolarFilter(h, w, args.cx, args.cy)
+            H = None
+            note = "box"
+            if args.kernel == "gyro":
+                cyc = int(r["cycle_id"])
+                if cyc not in traces:
+                    ip = os.path.join(args.session, f"c{cyc:03d}_imu.csv")
+                    traces[cyc] = (load_gz(ip) if os.path.exists(ip) else None,
+                                   boot_offset(args.session, cyc))
+                tr, off = traces[cyc]
+                ts = int(r["sensor_timestamp_ns"]) - off
+                exp = int(float(r["exposure_time_us"]) * 1000)
+                a = ts if args.window == "B" else ts - exp
+                a += int(args.readout_ms * 1e6 / 2)
+                th = angle_trace(tr[0], tr[1], a, a + exp) if tr else None
+                if th is None:
+                    print(f"{os.path.basename(path)}: no gyro trace for the window, box used")
+                else:
+                    th = th * args.angle_scale
+                    angle = float(th.max() - th.min())
+                    H = gyro_otf(geom.n_t, th)
+                    rate = np.interp(np.linspace(a, a + exp, 5), tr[0], tr[1])
+                    note = ("gyro rate " + " ".join(f"{v:+.1f}" for v in rate) + " deg/s")
+            else:
+                angle *= args.angle_scale
             corner_px = math.radians(angle) * math.hypot(w / 2, h / 2)
-            name = os.path.splitext(os.path.basename(path))[0] + "_deblur.jpg"
+            name = os.path.splitext(os.path.basename(path))[0] + f"_deblur{tag}.jpg"
             if corner_px < args.min_blur_px:
                 save(img, os.path.join(out_dir, name))
                 print(f"{os.path.basename(path)}: yaw {angle:.3f} deg, corner blur "
                       f"{corner_px:.2f} px < {args.min_blur_px}, copied")
                 continue
-            save(deblur(img, angle, args.snr, geom=geom), os.path.join(out_dir, name))
+            save(deblur(img, angle, args.snr, geom=geom, H=H), os.path.join(out_dir, name))
             print(f"{os.path.basename(path)}: yaw {angle:.3f} deg, corner blur "
-                  f"{corner_px:.1f} px -> _deblur/{name}  "
+                  f"{corner_px:.1f} px ({note}) -> _deblur/{name}  "
                   f"{time.monotonic() - t0:.1f} s, peak {peak_mb():.0f} MB")
         return
 
