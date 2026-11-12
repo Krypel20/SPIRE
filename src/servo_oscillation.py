@@ -21,10 +21,18 @@ Reading:
     mechanics (gear backlash, internal controller) rather than at the
     software loop, which a command filter would not remove.
 
-Writes servo_oscillation.png (mean spectra) next to the first session.
+CORRECTED cycles are grouped by the d_alpha stored in session.json, so
+sessions with different command filters can be compared in one run.
+Also printed: RMS inside a frequency band (default 5-15 Hz, around the
+coupled-oscillation peak).
+
+Writes servo_oscillation.png (mean spectra) next to the first session,
+or to --out.
 
 Usage (from deblur_data):
   python3 ../SPIRE/src/servo_oscillation.py session_20261107_14* session_20261108_121*
+  python3 ../SPIRE/src/servo_oscillation.py session_20261111_21* session_20261111_22* \\
+      --rate 5 30 --no-saturated -o d_alpha_compare.png
 """
 
 import argparse
@@ -81,16 +89,44 @@ def spectrum(x):
     return f, p
 
 
+def session_d_alpha(session):
+    try:
+        with open(os.path.join(session, "session.json")) as fh:
+            v = json.load(fh).get("flight_params", {}).get("d_alpha")
+        return None if v is None else float(v)
+    except (OSError, ValueError):
+        return None
+
+
+def band_rms(f, p, lo, hi):
+    m = (f >= lo) & (f <= hi)
+    if m.sum() < 2:
+        return float("nan")
+    return float(np.sqrt(np.trapezoid(p[m], f[m]) if hasattr(np, "trapezoid") else np.trapz(p[m], f[m])))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Camera/platform yaw wobble during bursts")
     ap.add_argument("sessions", nargs="+")
+    ap.add_argument("--rate", nargs=2, type=float, metavar=("LO", "HI"), default=None,
+                    help="keep only cycles with pre-burst platform rate in [LO, HI] deg/s "
+                         "(rate-match groups recorded with different rotation speeds)")
+    ap.add_argument("--no-saturated", action="store_true",
+                    help="drop cycles where the servo hit its +-135 deg limit in any frame")
+    ap.add_argument("--band", nargs=2, type=float, metavar=("LO", "HI"), default=(5.0, 15.0),
+                    help="frequency band for the band-limited RMS (default 5 15 Hz)")
+    ap.add_argument("-o", "--out", default=None,
+                    help="figure path (.png, a .pdf is written next to it); "
+                         "default servo_oscillation.png next to the first session")
     args = ap.parse_args()
 
-    groups = {}          # (mode, which) -> list of (rms, peak_hz, f, p)
+    groups = {}          # (group label, sensor) -> list of (rms, peak_hz, band_rms, f, p)
+    skipped = {"rate": 0, "saturated": 0}
     for s in sorted(args.sessions):
         mpath = os.path.join(s, "manifest.csv")
         if not os.path.exists(mpath):
             continue
+        da = session_d_alpha(s)
         with open(mpath, newline="") as fh:
             rows = list(csv.DictReader(fh))
         cycles = {}
@@ -100,7 +136,20 @@ def main():
             r0 = fr[0]
             if r0["cycle_valid"] not in TRUE or r0["mode"] == "STATIC":
                 continue
+            if args.rate:
+                try:
+                    rot = abs(float(r0["rotation_speed_dps"]))
+                except (KeyError, ValueError):
+                    rot = None
+                if rot is None or not (args.rate[0] <= rot <= args.rate[1]):
+                    skipped["rate"] += 1
+                    continue
+            if args.no_saturated and any(r.get("servo_saturated") in TRUE for r in fr):
+                skipped["saturated"] += 1
+                continue
             mode = f'{r0["mode"]}/{r0["effective_status"]}'
+            if r0["mode"] == "CORRECTED" and da is not None:
+                mode += f" d_alpha={da:g}"
             ip = os.path.join(s, f"c{cyc:03d}_imu.csv")
             if not os.path.exists(ip):
                 continue
@@ -115,30 +164,45 @@ def main():
                 f, p = spectrum(x)
                 k = 1 + int(np.argmax(p[1:]))
                 groups.setdefault((mode, which), []).append(
-                    (float(np.sqrt(np.mean(x ** 2))), float(f[k]), f, p))
+                    (float(np.sqrt(np.mean(x ** 2))), float(f[k]),
+                     band_rms(f, p, *args.band), f, p))
 
     if not groups:
         sys.exit("no cycles with c###_imu.csv found")
-    print("detrended yaw rate during bursts (valid cycles)")
-    print(f"{'mode':22s} {'sensor':9s} {'n':>4s} {'RMS median':>11s} {'peak Hz median':>15s}")
+    filt = []
+    if args.rate:
+        filt.append(f"pre-burst rate {args.rate[0]:g}-{args.rate[1]:g} deg/s ({skipped['rate']} cycles out)")
+    if args.no_saturated:
+        filt.append(f"no servo saturation ({skipped['saturated']} cycles out)")
+    print("detrended yaw rate during bursts (valid cycles"
+          + (", " + ", ".join(filt) if filt else "") + ")")
+    blo, bhi = args.band
+    print(f"{'group':34s} {'sensor':9s} {'n':>4s} {'RMS median':>11s} "
+          f"{'RMS ' + f'{blo:g}-{bhi:g} Hz':>14s} {'peak Hz median':>15s}")
     for (mode, which), v in sorted(groups.items()):
-        print(f"{mode:22s} {which:9s} {len(v):4d} {median(x[0] for x in v):9.2f} °/s"
-              f" {median(x[1] for x in v):13.1f}")
+        print(f"{mode:34s} {which:9s} {len(v):4d} {median(x[0] for x in v):9.2f} °/s"
+              f" {median(x[2] for x in v):9.2f} °/s {median(x[1] for x in v):13.1f}")
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    palette = ["#2a78d6", "#1a9e6a", "#8a4fd0", "#c2185b"]
     fig, ax = plt.subplots(figsize=(6.3, 3.6))
-    styles = {("CORRECTED/ACTIVE", "camera"): ("#2a78d6", "-", "Camera, servo active"),
-              ("CORRECTED/ACTIVE", "platform"): ("#2a78d6", "--", "Platform, servo active"),
-              ("UNCORRECTED/HELD", "camera"): ("#eb6834", "-", "Camera, servo held")}
-    for key, (col, ls, lab) in styles.items():
+    corrected = sorted({m for m, _ in groups if m.startswith("CORRECTED")})
+    plan = []
+    for i, m in enumerate(corrected):
+        col = palette[i % len(palette)]
+        tag = m.split(" ", 1)[1] if " " in m else "servo active"
+        plan.append(((m, "camera"), col, "-", f"Camera, {tag}"))
+        plan.append(((m, "platform"), col, "--", f"Platform, {tag}"))
+    plan.append((("UNCORRECTED/HELD", "camera"), "#eb6834", "-", "Camera, servo held"))
+    for key, col, ls, lab in plan:
         v = groups.get(key)
         if not v:
             continue
-        n = min(len(x[3]) for x in v)
-        p = np.mean([x[3][:n] for x in v], axis=0)
-        ax.semilogy(v[0][2][:n], p, color=col, linestyle=ls, linewidth=1.6,
+        n = min(len(x[4]) for x in v)
+        p = np.mean([x[4][:n] for x in v], axis=0)
+        ax.semilogy(v[0][3][:n], p, color=col, linestyle=ls, linewidth=1.6,
                     label=f"{lab} (n={len(v)})")
     ax.set_xlim(0, 100)
     ax.set_xlabel("Frequency [Hz]")
@@ -146,12 +210,12 @@ def main():
     ax.grid(True, color="#e6e5e1", linewidth=0.6)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
-    out = os.path.join(os.path.dirname(os.path.abspath(sorted(args.sessions)[0])),
-                       "servo_oscillation.png")
+    out = args.out or os.path.join(
+        os.path.dirname(os.path.abspath(sorted(args.sessions)[0])), "servo_oscillation.png")
     fig.savefig(out, dpi=200)
-    fig.savefig(out.replace(".png", ".pdf"))
+    fig.savefig(os.path.splitext(out)[0] + ".pdf")
     print(f"Written {out} (+ .pdf)")
 
 
