@@ -167,9 +167,13 @@ class PolarFilter:
         return out
 
 
-def deblur(img, angle_deg, snr=30.0, cx=None, cy=None, geom=None, linear=True, H=None):
+def deblur(img, angle_deg, snr=30.0, cx=None, cy=None, geom=None, linear=True, H=None,
+           luma=False):
     """img: HxWx3 float32 in 0..1. Returns the deblurred image. H: optional
-    OTF on the angle axis (e.g. from gyro_otf); default a box of angle_deg."""
+    OTF on the angle axis (e.g. from gyro_otf); default a box of angle_deg.
+    luma=True: filter only the luminance (Rec. 709 weights, linear light) and add
+    the recovered detail to all three channels; colour stays as captured. About
+    3x faster, since the polar filter runs once instead of once per channel."""
     h, w = img.shape[:2]
     geom = geom or PolarFilter(h, w, cx, cy)
     if H is None:
@@ -177,9 +181,13 @@ def deblur(img, angle_deg, snr=30.0, cx=None, cy=None, geom=None, linear=True, H
     W = np.conj(H) / (np.abs(H) ** 2 + 1.0 / snr)
     W = (W / W[0].real).astype(np.complex64)   # unit DC gain: no brightness loss
     lin = np.power(img, GAMMA) if linear else img
-    out = np.empty_like(img)
-    for c in range(img.shape[2]):
-        out[:, :, c] = geom.apply(lin[:, :, c], W)
+    if luma:
+        y = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+        out = lin + (geom.apply(y, W) - y)[:, :, None]
+    else:
+        out = np.empty_like(img)
+        for c in range(img.shape[2]):
+            out[:, :, c] = geom.apply(lin[:, :, c], W)
     np.clip(out, 0, 1, out=out)
     return np.power(out, 1 / GAMMA, out=out) if linear else out
 
@@ -309,6 +317,9 @@ def main():
                     help="skip frames whose yaw blur at the frame corner is below this")
     ap.add_argument("--interp", type=int, choices=(1, 3), default=3,
                     help="polar resampling: 3 = cubic (default), 1 = linear, ~2x faster")
+    ap.add_argument("--luma", action="store_true",
+                    help="deblur only the luminance and keep the captured colour: "
+                         "about 3x faster (onboard mode)")
     ap.add_argument("--cx", type=float)
     ap.add_argument("--cy", type=float)
     ap.add_argument("--synthetic", action="store_true",
@@ -328,6 +339,10 @@ def main():
         if args.angle_scale != 1.0:
             tag += f"_x{args.angle_scale:g}"
         tag += f"_snr{args.snr:g}"
+        if args.luma:
+            tag += "_luma"
+        if args.interp != 3:
+            tag += f"_i{args.interp}"
         out_dir = os.path.join(args.session, "_deblur")
         os.makedirs(out_dir, exist_ok=True)
         geom = None
@@ -372,7 +387,8 @@ def main():
                 print(f"{os.path.basename(path)}: yaw {angle:.3f} deg, corner blur "
                       f"{corner_px:.2f} px < {args.min_blur_px}, copied")
                 continue
-            save(deblur(img, angle, args.snr, geom=geom, H=H), os.path.join(out_dir, name))
+            save(deblur(img, angle, args.snr, geom=geom, H=H, luma=args.luma),
+                 os.path.join(out_dir, name))
             print(f"{os.path.basename(path)}: yaw {angle:.3f} deg, corner blur "
                   f"{corner_px:.1f} px ({note}) -> _deblur/{name}  "
                   f"{time.monotonic() - t0:.1f} s, peak {peak_mb():.0f} MB")
@@ -387,7 +403,7 @@ def main():
           f"samples on the angle axis")
     if args.synthetic:
         b = blur(img, args.angle_deg, geom)
-        out = deblur(b, args.angle_deg, args.snr, geom=geom)
+        out = deblur(b, args.angle_deg, args.snr, geom=geom, luma=args.luma)
         h, w = img.shape[:2]
         yy, xx = np.mgrid[0:h, 0:w]
         inner = np.hypot(xx - geom.cx, yy - geom.cy) < min(h, w) / 2 - 2
@@ -395,7 +411,7 @@ def main():
         print(f"PSNR restored {psnr(img[inner], out[inner]):.2f} dB")
         save(b, args.output.replace(".jpg", "_blurred.jpg"))
     else:
-        out = deblur(img, args.angle_deg, args.snr, geom=geom)
+        out = deblur(img, args.angle_deg, args.snr, geom=geom, luma=args.luma)
     save(out, args.output)
     print(f"Written {args.output}  {time.monotonic() - t0:.1f} s, peak {peak_mb():.0f} MB")
 
