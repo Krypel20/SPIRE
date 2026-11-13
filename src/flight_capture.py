@@ -768,9 +768,13 @@ def exposure_motion_px(samples3, ts_ns, exp_ns, lens_mm,
       yaw_px  = radius_px * range_z                 at radius_px from the centre
       score   = tilt_px + yaw_px                    upper bound at radius_px
 
-    The SensorTimestamp window is uncertain (start or end of the first row's
-    exposure), so both [ts-exp, ts] and [ts, ts+exp] are evaluated and the
-    larger value is kept. Returns None if the trace does not cover either.
+    Window: [ts, ts+exp]. libcamera's SensorTimestamp is the start of
+    exposure of the first row; the deblur window test confirmed it on this
+    camera. Test B (08.11, 24 servo-corrected bursts) ranked the frames picked
+    this way at least as well by image sharpness as the earlier max over
+    [ts-exp, ts] and [ts, ts+exp] (top-1 12/24 both, mean rank 1.96 vs 2.25),
+    and better than the window shifted by half the readout (7/24).
+    Returns None if the trace does not cover the window.
     """
     if not samples3 or not ts_ns or not exp_ns:
         return None
@@ -805,12 +809,10 @@ def exposure_motion_px(samples3, ts_ns, exp_ns, lens_mm,
             ranges.append(math.radians(hi - lo))
         return (f_px * math.hypot(ranges[0], ranges[1]), radius_px * ranges[2])
 
-    res = [r for r in (window(ts_ns - exp_ns, ts_ns), window(ts_ns, ts_ns + exp_ns))
-           if r is not None]
-    if not res:
+    res = window(ts_ns, ts_ns + exp_ns)
+    if res is None:
         return None
-    tilt = max(r[0] for r in res)
-    yaw = max(r[1] for r in res)
+    tilt, yaw = res
     return {"tilt_px": tilt, "yaw_px": yaw, "score_px": tilt + yaw}
 
 # ---------------------------------------------------------------------------
