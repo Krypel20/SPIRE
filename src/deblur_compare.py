@@ -11,6 +11,12 @@ crops and in the centre, so "no visible difference" can be told apart from
 
 Usage:
   python3 deblur_compare.py --session DIR --frame c026_CORRECTED_f3.jpg [--crop 400]
+
+Figure for a document: only chosen variants, chosen crops, own labels and file:
+  python3 deblur_compare.py --session DIR --frame c026_CORRECTED_f3.jpg \
+      --variants deblur_gyroA_ro60_snr30 deblur_gyroB_ro60_snr30 \
+      --labels "original" "window A" "window B" \
+      --boxes top-left bottom-right -o fig_window_test.jpg
 """
 
 import argparse
@@ -19,6 +25,9 @@ import os
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+
+BOX_NAMES = ("top-left", "top-right", "centre", "bottom-left", "bottom-right")
 
 
 def boxes(w, h, c, inset):
@@ -37,26 +46,47 @@ def main():
     ap.add_argument("--frame", required=True)
     ap.add_argument("--crop", type=int, default=400, help="crop size in px (100 %%)")
     ap.add_argument("--inset", type=int, default=150, help="distance of corner crops from the edge")
+    ap.add_argument("--variants", nargs="+",
+                    help="only these variants, given by the part of the file name after "
+                         "'<frame>_' (e.g. deblur_gyroB_ro60_snr30); default: all")
+    ap.add_argument("--labels", nargs="+",
+                    help="column titles: original first, then one per variant")
+    ap.add_argument("--boxes", nargs="+", choices=BOX_NAMES,
+                    help="crops to show (default: all five)")
+    ap.add_argument("-o", "--output", help="panel file (default DIR/_deblur/<frame>_compare.jpg)")
     args = ap.parse_args()
 
     stem = os.path.splitext(args.frame)[0]
     orig_path = os.path.join(args.session, args.frame)
-    variants = sorted(glob.glob(os.path.join(args.session, "_deblur", f"{stem}_deblur*.jpg")))
+    if args.variants:
+        variants = [os.path.join(args.session, "_deblur", f"{stem}_{v}.jpg") for v in args.variants]
+        missing = [v for v in variants if not os.path.exists(v)]
+        if missing:
+            raise SystemExit("missing: " + ", ".join(missing))
+    else:
+        variants = sorted(glob.glob(os.path.join(args.session, "_deblur", f"{stem}_deblur*.jpg")))
     if not variants:
         raise SystemExit(f"no {stem}_deblur*.jpg in {args.session}/_deblur")
     images = [("original", Image.open(orig_path).convert("RGB"))]
     images += [(os.path.basename(v)[len(stem) + 1:-4], Image.open(v).convert("RGB"))
                for v in variants]
+    if args.labels:
+        if len(args.labels) != len(images):
+            raise SystemExit(f"--labels needs {len(images)} names (original + variants)")
+        images = [(lab, im) for lab, (_n, im) in zip(args.labels, images)]
     w, h = images[0][1].size
-    bx = boxes(w, h, args.crop, args.inset)
+    allb = boxes(w, h, args.crop, args.inset)   # statistics always on all five
+    bx = dict(allb)
+    if args.boxes:
+        bx = {k: v for k, v in bx.items() if k in args.boxes}
 
     o = np.asarray(images[0][1], dtype=np.float32)
     print(f"{args.frame}: mean |variant - original| in 8-bit levels")
     for name, im in images[1:]:
         a = np.asarray(im, dtype=np.float32)
         corner = np.mean([np.abs(a[y0:y1, x0:x1] - o[y0:y1, x0:x1]).mean()
-                          for k, (x0, y0, x1, y1) in bx.items() if k != "centre"])
-        x0, y0, x1, y1 = bx["centre"]
+                          for k, (x0, y0, x1, y1) in allb.items() if k != "centre"])
+        x0, y0, x1, y1 = allb["centre"]
         centre = np.abs(a[y0:y1, x0:x1] - o[y0:y1, x0:x1]).mean()
         print(f"  {name:22s} corners {corner:5.2f}   centre {centre:5.2f}")
 
@@ -69,7 +99,7 @@ def main():
             panel.paste(im.crop(b), (j * (c + pad), head + i * (c + pad)))
             if j == 0:
                 d.text((4, head + i * (c + pad) + 4), k, fill="yellow")
-    out = os.path.join(args.session, "_deblur", f"{stem}_compare.jpg")
+    out = args.output or os.path.join(args.session, "_deblur", f"{stem}_compare.jpg")
     panel.save(out, quality=92)
     print(f"Written {out}")
 

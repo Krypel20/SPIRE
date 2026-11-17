@@ -12,7 +12,9 @@ other / sharper frames.
 
 For every valid burst the script recomputes the gyro3 score of all frames from
 c###_imu.csv with each rule, takes the winner (lowest score) and reports:
-  1. sanity: rule maxAB must reproduce the logged winner and score_px,
+  1. sanity: the rule used when the session was recorded (--logged-rule:
+     maxAB for Test B, B for sessions recorded with the flight code of
+     13.11 or later) must reproduce the logged winner and score_px,
   2. how often B / B+ro change the winner compared with maxAB,
   3. with --sharp (sharpness_frames.csv from sharpness_check.py): the
      within-burst rank of each rule's winner by image blur (1 = sharpest of 6;
@@ -102,6 +104,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sessions", nargs="+")
     ap.add_argument("--sharp", help="sharpness_frames.csv from sharpness_check.py")
+    ap.add_argument("--logged-rule", choices=("maxAB", "B"), default="maxAB",
+                    help="rule the sessions were recorded with: maxAB (Test B, "
+                         "default) or B (flight code from 13.11)")
     ap.add_argument("--readout-ms", type=float, default=60.0,
                     help="rolling-shutter readout for rule B+ro (shift = half of it)")
     args = ap.parse_args()
@@ -114,7 +119,7 @@ def main():
 
     rules = ("maxAB", "B", "B+ro")
     bursts = []           # dicts: session, cycle, mode, logged winner, per-rule winners
-    sanity = []           # |recomputed maxAB score - logged score_px|
+    sanity = []           # |recomputed logged-rule score - logged score_px|
     skipped = 0
     for s in sorted(args.sessions):
         name = os.path.basename(os.path.normpath(s))
@@ -158,7 +163,8 @@ def main():
                 scores["B"].append(sum(wb))
                 scores["B+ro"].append(sum(wr))
                 if r.get("score_px") not in (None, ""):
-                    sanity.append(abs(mx - float(r["score_px"])))
+                    rec = mx if args.logged_rule == "maxAB" else sum(wb)
+                    sanity.append(abs(rec - float(r["score_px"])))
             if not ok:
                 skipped += 1
                 continue
@@ -173,10 +179,11 @@ def main():
     if not bursts:
         return
     if sanity:
-        print(f"sanity, maxAB vs logged score_px: median |diff| {median(sanity):.3f} px, "
-              f"max {max(sanity):.2f} px")
-    same = sum(b["win"]["maxAB"] == b["logged"] for b in bursts if b["logged"] is not None)
-    print(f"sanity, maxAB winner = logged winner: {same}/{len(bursts)}\n")
+        print(f"sanity, {args.logged_rule} vs logged score_px: median |diff| "
+              f"{median(sanity):.3f} px, max {max(sanity):.3f} px")
+    lr = args.logged_rule
+    same = sum(b["win"][lr] == b["logged"] for b in bursts if b["logged"] is not None)
+    print(f"sanity, {lr} winner = logged winner: {same}/{len(bursts)}\n")
 
     print("winner changed compared with maxAB:")
     for mode in ("UNCORRECTED", "CORRECTED"):

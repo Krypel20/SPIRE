@@ -31,6 +31,7 @@ import logging
 import threading
 import io
 import collections
+import csv
 import socket
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -295,8 +296,14 @@ class Camera:
             })
         return frames
 
-    def commit_burst_winner(self, frame_id, winner, losers, metadata=None):
-        """Rename winning temp frame to final name, delete losers, write meta."""
+    def commit_burst_winner(self, frame_id, winner, losers, metadata=None,
+                            trace_rows=None):
+        """Rename winning temp frame to final name, delete losers, write meta.
+
+        trace_rows: camera gyro samples (mono_ns, gx, gy, gz) around the burst,
+        written next to the photo as <photo>_imu.csv for deblurring after the
+        flight. A failed trace write is logged and never stops the capture.
+        """
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename = f"spire_{timestamp}_{frame_id:04d}.jpg"
         filepath = os.path.join(self.output_dir, filename)
@@ -308,6 +315,25 @@ class Camera:
                 pass
         self.session_photos.append(filename)
         self.last_capture_time = time.time()
+        if trace_rows:
+            trace_path = filepath.replace(".jpg", "_imu.csv")
+            try:
+                with open(trace_path, "w", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["source", "mono_ns", "gyro_z_dps",
+                                "gyro_x_dps", "gyro_y_dps"])
+                    for ts, gx, gy, gz in trace_rows:
+                        w.writerow(["camera", int(ts), f"{gz:.4f}", f"{gx:.4f}", f"{gy:.4f}"])
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                if metadata is not None:
+                    metadata["imu_trace_file"] = os.path.basename(trace_path)
+                    metadata["imu_trace_samples"] = len(trace_rows)
+            except OSError as e:
+                log.warning(f"Photo {frame_id}: gyro trace not written ({e})")
+        elif metadata is not None:
+            metadata["imu_trace_file"] = None
+            metadata["imu_trace_samples"] = 0
         if metadata:
             metadata["sensor_timestamp_ns"] = winner["sensor_timestamp_ns"]
             metadata["exposure_time_us"] = winner["exposure_time_us"]
@@ -688,6 +714,12 @@ class StabilizationPID:
 # no new samples, so the gap grows and the frame is not trusted.
 MAX_MATCH_GAP_MS = 20.0
 
+# Gyro trace saved with every kept photo: from this long before the first
+# exposure of the burst to this long after the end of the last one. Same
+# margin and CSV format as bench_stab_test (c###_imu.csv), so the offline
+# tools (rot_deblur, gyro3_window_check) can read flight traces too.
+TRACE_MARGIN_NS = 100_000_000
+
 # PIDThread ignores platform samples older than this (LSM9DS1 runs at 200 Hz,
 # so a healthy sample is at most ~5-15 ms old).
 PID_STALE_NS = 50_000_000
@@ -814,6 +846,22 @@ def exposure_motion_px(samples3, ts_ns, exp_ns, lens_mm,
         return None
     tilt, yaw = res
     return {"tilt_px": tilt, "yaw_px": yaw, "score_px": tilt + yaw}
+
+def burst_trace_rows(samples3, frames, boottime_to_mono_offset_ns,
+                     margin_ns=TRACE_MARGIN_NS):
+    """Camera gyro samples covering all exposures of a burst plus a margin.
+
+    frames carry sensor_timestamp_ns (CLOCK_BOOTTIME) and exposure_time_us;
+    samples3 are (mono_ns, gx, gy, gz) in CLOCK_MONOTONIC.
+    """
+    exps = [(f["sensor_timestamp_ns"] - boottime_to_mono_offset_ns,
+             int(f.get("exposure_time_us", 0) * 1000))
+            for f in frames if f.get("sensor_timestamp_ns")]
+    if not exps or not samples3:
+        return []
+    t0 = min(t for t, _ in exps) - margin_ns
+    t1 = max(t + e for t, e in exps) + margin_ns
+    return [s for s in samples3 if t0 <= s[0] <= t1]
 
 # ---------------------------------------------------------------------------
 # PID thread — runs servo independently of capture timing
@@ -1382,7 +1430,19 @@ Examples:
                         winner["exposure_cam_gz"], 1
                     )
                     metadata["winner_score_px"] = round(winner["exposure_score_px"], 2)
-                    camera.commit_burst_winner(frame_id, winner, losers, metadata)
+                    # Inputs for deblurring after the flight: exposure of every
+                    # burst frame and the clock offset to the gyro trace.
+                    metadata["boot_mono_offset_ns"] = boottime_to_mono_offset_ns
+                    metadata["burst_sensor_timestamp_ns"] = [
+                        f["sensor_timestamp_ns"] for f in scored
+                    ]
+                    metadata["burst_exposure_time_us"] = [
+                        f["exposure_time_us"] for f in scored
+                    ]
+                    trace = burst_trace_rows(cam_logger.samples3(), scored,
+                                             boottime_to_mono_offset_ns)
+                    camera.commit_burst_winner(frame_id, winner, losers, metadata,
+                                               trace_rows=trace)
                     log.info(
                         f"[Cycle {frame_id}] BURST {args.burst_count} frames, "
                         f"score_px={metadata['burst_score_px']} "
